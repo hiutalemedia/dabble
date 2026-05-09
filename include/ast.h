@@ -17,10 +17,11 @@ struct FnStmt     { std::string name; std::vector<std::string> params; std::vect
 struct SQLStmt    { std::string sql; std::string redirect_file; bool append = false; };
 struct PrintStmt  { std::string text; };
 struct ImportStmt { std::string filename; };
+struct ProjectionStmt { std::string name, cols; };  // named column list for ...spread
 
 struct ASTNode {
     std::variant<LetStmt, ValStmt, ForStmt, IfStmt, WhileStmt, ExpectStmt,
-                 FnStmt, SQLStmt, PrintStmt, ImportStmt> node;
+                 FnStmt, SQLStmt, PrintStmt, ImportStmt, ProjectionStmt> node;
     int line_no = 0;
 
     template<typename T>

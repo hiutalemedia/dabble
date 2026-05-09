@@ -40,9 +40,14 @@ std::vector<ASTPtr> Parser::parseBlock(int baseIndent) {
         else if (t.rfind("if ", 0) == 0)     block.push_back(parseIf(baseIndent));
         else if (t.rfind("while ", 0) == 0)  block.push_back(parseWhile(baseIndent));
         else if (t.rfind("expect ", 0) == 0) block.push_back(parseExpect(baseIndent));
+        else if (t.rfind("check ", 0) == 0)  block.push_back(parseExpect(baseIndent));
         else if (t.rfind("fn ", 0) == 0)     block.push_back(parseFn(baseIndent));
         else if (t.rfind("print ", 0) == 0)  block.push_back(parsePrint());
-        else if (t.rfind("import ", 0) == 0) block.push_back(parseImport());
+        else if (t.rfind("import ", 0) == 0)     block.push_back(parseImport());
+        else if (t.rfind("projection ", 0) == 0) block.push_back(parseProjection(baseIndent));
+        else if (t.rfind("proj ", 0) == 0)       block.push_back(parseProjection(baseIndent));
+        else if (t.rfind("columns ", 0) == 0)    block.push_back(parseProjection(baseIndent));
+        else if (t.rfind("cols ", 0) == 0)       block.push_back(parseProjection(baseIndent));
         else                                 block.push_back(parseRawSQL(baseIndent));
     }
     return block;
@@ -74,12 +79,14 @@ std::string Parser::collectSQL(int minIndent, std::string& redirect_file, bool& 
             t.rfind("for ", 0) == 0 || t.rfind("if ", 0) == 0 ||
             t.rfind("while ", 0) == 0 || t.rfind("expect ", 0) == 0 ||
             t.rfind("fn ", 0) == 0 || t.rfind("print ", 0) == 0 ||
-            t.rfind("import ", 0) == 0 || t.rfind("else", 0) == 0) {
+            t.rfind("import ", 0) == 0 || t.rfind("else", 0) == 0 ||
+            t.rfind("projection ", 0) == 0 || t.rfind("proj ", 0) == 0 ||
+            t.rfind("columns ", 0) == 0 || t.rfind("cols ", 0) == 0) {
             break;
         }
 
         // Redirect operator ends the statement
-        std::regex redir(R"(^(.*)\s*(>>|>)\s*([^\s>]+)\s*$)");
+        std::regex redir(R"(^(.*)\s*(>>|->|>)\s*([^\s>]+)\s*$)");
         std::smatch match;
         if (std::regex_match(t, match, redir)) {
             // Strip trailing semicolon from the SQL part if present
@@ -88,6 +95,7 @@ std::string Parser::collectSQL(int minIndent, std::string& redirect_file, bool& 
             sql += (sql.empty() ? "" : "\n") + sql_part;
             redirect_file = match[3].str();
             append = (match[2].str() == ">>");
+            // -> is non-appending export, same as >
             pos++;
             break;
         }
@@ -121,6 +129,45 @@ std::string Parser::collectSQL(int minIndent, std::string& redirect_file, bool& 
 }
 
 // ====================== INDIVIDUAL PARSERS ======================
+
+ASTPtr Parser::parseProjection(int baseIndent) {
+    int ln = pos + 1;
+    std::string line = trim(lines[pos]);
+
+    // Detect prefix length: "projection "(11), "proj "(5), "columns "(8), "cols "(5)
+    int prefix = 5;  // default: proj / cols
+    if (line.rfind("projection ", 0) == 0) prefix = 11;
+    else if (line.rfind("columns ", 0) == 0) prefix = 8;
+
+    // Name is between the keyword and '=' or end of line
+    auto eq = line.find('=');
+    std::string name = (eq != std::string::npos)
+        ? trim(line.substr(prefix, eq - prefix))
+        : trim(line.substr(prefix));
+
+    // Column list: either on same line after '=', or on indented lines below
+    std::string cols;
+    if (eq != std::string::npos) {
+        cols = trim(line.substr(eq + 1));
+    }
+    pos++;
+
+    // Collect continuation lines (indented deeper)
+    while (pos < (int)lines.size()) {
+        int lvl = indentLevel(lines[pos]);
+        if (lvl <= baseIndent) break;
+        std::string t = trim(lines[pos]);
+        if (t.empty() || t.rfind("--", 0) == 0) { pos++; continue; }
+        if (!cols.empty()) cols += ",\n    ";
+        cols += t;
+        // Strip trailing comma if present — we add our own
+        if (!cols.empty() && cols.back() == ',') cols.pop_back();
+        pos++;
+    }
+
+    // Normalise: ensure commas between items if multi-line
+    return std::make_shared<ASTNode>(ProjectionStmt{name, trim(cols)}, ln);
+}
 
 ASTPtr Parser::parseRawSQL(int baseIndent) {
     int ln = pos + 1;
@@ -174,6 +221,18 @@ ASTPtr Parser::parseFor(int baseIndent) {
     auto inpos = line.find(" in ");
     std::string var = trim(line.substr(4, inpos - 4));
     std::string src = trim(line.substr(inpos + 4, line.find(':') - (inpos + 4)));
+
+    // table.column shorthand: "for name in customers.name:"
+    // → source becomes "(SELECT name FROM customers)"
+    // The loop variable then IS the value — no .column suffix needed.
+    auto dot = src.find('.');
+    if (dot != std::string::npos &&
+        src.find(' ') == std::string::npos &&
+        src.find('(') == std::string::npos) {
+        std::string tbl = src.substr(0, dot);
+        std::string col = src.substr(dot + 1);
+        src = "(SELECT " + col + " FROM " + tbl + ")";
+    }
 
     pos++;
     auto body = parseBlock(baseIndent + 4);

@@ -27,9 +27,15 @@ int indentLevel(const std::string& line) {
     return c;
 }
 
-std::string replaceAll(std::string s, const std::unordered_map<std::string,std::string>& env) {
-    // Explicit {{var.col}} style
-    for (const auto& [k, v] : env) {
+std::string replaceAll(std::string s,
+    const std::unordered_map<std::string,std::string>& env,
+    const std::unordered_map<std::string,std::string>& raw) {
+
+    // {{name}} — raw string injection for SQL construction.
+    // Fetches the actual string value so fragments like join clauses,
+    // identifiers, and WHERE conditions are inlined verbatim.
+    // Check raw first; fall back to env (which holds getvariable() refs).
+    for (const auto& [k, v] : raw) {
         std::string placeholder = "{{" + k + "}}";
         size_t pos = 0;
         while ((pos = s.find(placeholder, pos)) != std::string::npos) {
@@ -37,8 +43,19 @@ std::string replaceAll(std::string s, const std::unordered_map<std::string,std::
             pos += v.size();
         }
     }
+    // Also handle {{name}} for loop variables (row.col) from env
+    for (const auto& [k, v] : env) {
+        std::string placeholder = "{{" + k + "}}";
+        size_t pos = 0;
+        while ((pos = s.find(placeholder, pos)) != std::string::npos) {
+            // Don't double-substitute if raw already handled it
+            s.replace(pos, placeholder.size(), v);
+            pos += v.size();
+        }
+    }
 
-    // Shorthand f.name with boundaries
+    // bare name — typed value reference, injects getvariable() fragment.
+    // Only from env (loop vars and for-loop columns).
     for (const auto& [k, v] : env) {
         size_t pos = 0;
         while ((pos = s.find(k, pos)) != std::string::npos) {

@@ -26,9 +26,53 @@ namespace {
     std::string dim   (const std::string& s) { return colors_on() ? DIM    + s + RESET : s; }
 }
 
-Interpreter::Interpreter(duckdb_connection c, bool verbose) : conn(c), verbose(verbose) {}
+Interpreter::Interpreter(duckdb_connection c, bool verbose, bool progress)
+    : conn(c), verbose(verbose), show_progress(progress),
+      progress_is_tty(progress && isatty(STDERR_FILENO)) {}
 
-// ====================== LOC + DBEXEC ======================
+
+// ====================== PROGRESS ======================
+
+void Interpreter::clearProgressLine() {
+    if (!show_progress || !progress_is_tty || !progress_line_active) return;
+    std::cerr << "\r\033[2K";  // carriage return + erase line
+    progress_line_active = false;
+}
+
+void Interpreter::emitProgress(const std::string& label, int cur, int tot) {
+    if (!show_progress) return;
+
+    int s_cur = (cur >= 0) ? cur : current_stmt;
+    int s_tot = (tot >= 0) ? tot : total_stmts;
+
+    if (progress_is_tty) {
+        // Human mode: animated bar that overwrites itself
+        const int bar_width = 24;
+        int filled = (s_tot > 0) ? (s_cur * bar_width / s_tot) : 0;
+        std::string bar(filled, '=');
+        if (filled < bar_width) { bar += '>'; bar += std::string(bar_width - filled - 1, ' '); }
+
+        // Truncate label to fit terminal
+        std::string lbl = label.size() > 36 ? label.substr(0, 35) + "…" : label;
+
+        std::cerr << "\r\033[2K"   // erase line
+                  << "\033[2m["    // dim
+                  << bar << "] "
+                  << s_cur << "/" << s_tot
+                  << " " << lbl
+                  << "\033[0m"
+                  << std::flush;
+        progress_line_active = true;
+    } else {
+        // Machine mode: structured lines on stderr, one per event
+        std::cerr << "PROGRESS " << s_cur << "/" << s_tot;
+        if (!label.empty()) std::cerr << " " << label;
+        if (cur >= 0 && tot > 0) std::cerr << " (" << cur << "/" << tot << ")";
+        std::cerr << "\n";
+    }
+}
+
+// ====================== LOC + DBEXEC =======================
 
 std::string Interpreter::loc() const {
     std::string file = file_stack.empty() ? "<unknown>" : file_stack.back();
@@ -61,23 +105,49 @@ void Interpreter::run(const std::vector<ASTPtr>& prog, const std::string& source
     if (!source_file.empty()) {
         file_stack.push_back(std::filesystem::absolute(source_file).string());
     }
-    execBlock(prog, {});
+    total_stmts = (int)prog.size();
+    current_stmt = 0;
+    execBlock(prog, {}, {}, true);  // top_level=true
+    if (show_progress) {
+        clearProgressLine();
+        if (!progress_is_tty) std::cerr << "PROGRESS DONE\n";
+    }
     if (!source_file.empty()) {
         file_stack.pop_back();
     }
 }
 
-void Interpreter::execBlock(const std::vector<ASTPtr>& block, Env env) {
+void Interpreter::execBlock(const std::vector<ASTPtr>& block, Env env, RawEnv raw, bool top_level) {
     for (auto& n : block) {
         current_line = n->line_no;  // keep loc() current
-        std::visit([&](auto&& x){ exec(x, env); }, n->node);
+        std::visit([&](auto&& x){ exec(x, env, raw); }, n->node);
     }
 }
 
 // ====================== HELPERS ======================
 
-std::string Interpreter::resolve(const std::string& sql, const Env& env) {
-    return replaceEnvVars(replaceAll(sql, env));
+std::string Interpreter::resolve(const std::string& sql, const Env& env, const RawEnv& raw) {
+    // Pre-pass: expand ...projection_name into its column list.
+    // Done before replaceAll so the expanded SQL can itself contain {{vars}}.
+    std::string s = sql;
+    size_t p = 0;
+    while ((p = s.find("...", p)) != std::string::npos) {
+        // Extract identifier after ...
+        size_t start = p + 3;
+        size_t end = start;
+        while (end < s.size() && (std::isalnum((unsigned char)s[end]) || s[end] == '_')) end++;
+        if (end > start) {
+            std::string name = s.substr(start, end - start);
+            auto it = projections.find(name);
+            if (it != projections.end()) {
+                s.replace(p, end - p, it->second);
+                p += it->second.size();
+                continue;
+            }
+        }
+        p++;
+    }
+    return replaceEnvVars(replaceAll(s, env, raw));
 }
 
 bool Interpreter::isFunctionCall(const std::string& sql, std::string& fn_name,
@@ -124,6 +194,110 @@ bool Interpreter::isFunctionCall(const std::string& sql, std::string& fn_name,
     return true;
 }
 
+// ====================== INFER FROM ======================
+// If the expression has no FROM clause and no SELECT, look for the columns
+// it references in the known_tables set. If all referenced columns resolve
+// to exactly one table, append "FROM that_table" automatically.
+// If ambiguous or nothing matches, return the expression unchanged —
+// DuckDB will produce a clear error if it can't resolve it.
+
+std::string Interpreter::inferFrom(const std::string& expr) {
+    std::string upper = expr;
+    std::transform(upper.begin(), upper.end(), upper.begin(),
+                   [](unsigned char c){ return std::toupper(c); });
+
+    // Only act on expressions with no FROM/SELECT already
+    if (upper.find(" FROM ") != std::string::npos ||
+        upper.rfind("SELECT", 0) == 0 ||
+        upper.rfind("WITH", 0) == 0 ||
+        known_tables.empty()) {
+        return expr;
+    }
+
+    // Query information_schema for all columns across known tables.
+    // Build: WHERE table_name IN ('t1','t2',...) AND table_schema = 'temp'
+    std::string in_list;
+    for (const auto& t : known_tables) {
+        if (!in_list.empty()) in_list += ",";
+        in_list += "'" + t + "'";
+    }
+    std::string schema_q =
+        "SELECT table_name, column_name "
+        "FROM information_schema.columns "
+        "WHERE table_schema = 'temp' AND table_name IN (" + in_list + ") "
+        "ORDER BY table_name, column_name";
+
+    duckdb_result res;
+    if (!dbExec(schema_q, &res).empty()) {
+        duckdb_destroy_result(&res);
+        return expr;
+    }
+
+    // Build map: column_name → list of tables that have it
+    std::unordered_map<std::string, std::vector<std::string>> col_tables;
+    idx_t rows = duckdb_row_count(&res);
+    for (idx_t r = 0; r < rows; r++) {
+        char* tbl = duckdb_value_varchar(&res, 0, r);
+        char* col = duckdb_value_varchar(&res, 1, r);
+        if (tbl && col) col_tables[col].push_back(tbl);
+        if (tbl) duckdb_free(tbl);
+        if (col) duckdb_free(col);
+    }
+    duckdb_destroy_result(&res);
+
+    // Extract word tokens from the expression that could be column names.
+    // For each recognised column, collect which known tables have it.
+    // The candidate table set is the INTERSECTION across all found columns —
+    // we want tables that have ALL the referenced columns, not any of them.
+    std::set<std::string> candidate_tables;
+    bool first_col = true;
+    std::string tok;
+    for (size_t i = 0; i <= expr.size(); i++) {
+        char c = (i < expr.size()) ? expr[i] : 0;
+        if (std::isalnum((unsigned char)c) || c == '_') {
+            tok += c;
+        } else {
+            if (!tok.empty()) {
+                std::string tu = tok;
+                std::transform(tu.begin(), tu.end(), tu.begin(),
+                               [](unsigned char c){ return std::toupper(c); });
+                static const std::set<std::string> kws = {
+                    "SELECT","FROM","WHERE","AND","OR","NOT","AS","IN","IS",
+                    "NULL","TRUE","FALSE","BY","GROUP","ORDER","HAVING",
+                    "LIMIT","OFFSET","CASE","WHEN","THEN","ELSE","END",
+                    "COUNT","SUM","AVG","MIN","MAX","ROUND","CAST","OVER",
+                    "DISTINCT","ALL","EXISTS","BETWEEN","LIKE","ILIKE"
+                };
+                if (kws.find(tu) == kws.end() && !std::isdigit((unsigned char)tok[0])) {
+                    auto it = col_tables.find(tok);
+                    if (it != col_tables.end()) {
+                        std::set<std::string> col_set(it->second.begin(), it->second.end());
+                        if (first_col) {
+                            candidate_tables = col_set;
+                            first_col = false;
+                        } else {
+                            // Intersect: keep only tables present in both sets
+                            std::set<std::string> intersected;
+                            for (const auto& t : candidate_tables) {
+                                if (col_set.count(t)) intersected.insert(t);
+                            }
+                            candidate_tables = intersected;
+                        }
+                    }
+                }
+                tok.clear();
+            }
+        }
+    }
+
+    if (candidate_tables.size() == 1) {
+        if (verbose) std::cout << dim("  inferred FROM " + *candidate_tables.begin()) << "\n";
+        return expr + " FROM " + *candidate_tables.begin();
+    }
+    // Ambiguous or no match — return unchanged, let DuckDB error naturally
+    return expr;
+}
+
 bool Interpreter::evalCond(std::string cond, Env& env) {
     cond = resolve(cond, env);
 
@@ -142,7 +316,13 @@ bool Interpreter::evalCond(std::string cond, Env& env) {
     } else if (upper.find(" FROM ") != std::string::npos) {
         normalised = "SELECT " + cond;          // has FROM, just needs SELECT
     } else {
-        normalised = "SELECT (" + cond + ")";   // pure expression
+        // No FROM — try to infer it from known tables
+        std::string inferred = inferFrom(cond);
+        if (inferred != cond) {
+            normalised = "SELECT " + inferred;  // successfully inferred FROM
+        } else {
+            normalised = "SELECT (" + cond + ")";  // pure scalar expression
+        }
     }
 
     std::string query = "SELECT 1 FROM (" + normalised + ") AS _cond_src WHERE (" +
@@ -154,7 +334,7 @@ bool Interpreter::evalCond(std::string cond, Env& env) {
     duckdb_result res;
     std::string err = dbExec(query, &res);
     if (!err.empty()) {
-        std::cerr << red("error: ") << loc() << "condition: " << err << "\n";
+        clearProgressLine(); std::cerr << red("error: ") << loc() << "condition: " << err << "\n";
         duckdb_destroy_result(&res);
         return false;
     }
@@ -192,12 +372,22 @@ void Interpreter::printResult(duckdb_result* res) {
 
 // ====================== FUNCTION DEFINITION ======================
 
-void Interpreter::exec(const FnStmt& s, Env& env) {
+void Interpreter::exec(const FnStmt& s, Env& env, RawEnv& raw) {
     functions[s.name] = s;
     if (verbose) std::cout << dim("✓ defined fn " + s.name + "()") << "\n";
 }
 
-// ====================== FUNCTION EXECUTION ======================
+
+// ====================== PROJECTION ======================
+
+void Interpreter::exec(const ProjectionStmt& s, Env& env, RawEnv& raw) {
+    // Resolve any {{vars}} in the column list at definition time.
+    std::string cols = resolve(s.cols, env, raw);
+    projections[s.name] = cols;
+    if (verbose) std::cout << dim("✓ projection " + s.name) << "\n";
+}
+
+// ====================== FUNCTION EXECUTION =======================
 //
 // Functions never touch the database during execution.
 // - let x = ...   → accumulated as CTE (lazy, no temp table)
@@ -208,7 +398,7 @@ void Interpreter::exec(const FnStmt& s, Env& env) {
 // producing a flat single WITH chain in the returned FnResult.
 
 FnResult Interpreter::execFn(const FnStmt& fn, Env env,
-                              const std::vector<std::string>& args) {
+                              const std::vector<std::string>& args, RawEnv raw) {
     FnResult result;
 
     fn_depth++;
@@ -216,7 +406,7 @@ FnResult Interpreter::execFn(const FnStmt& fn, Env env,
 
     // Validate arity up front
     if (args.size() != fn.params.size()) {
-        std::cerr << red("error: ") << loc() << "fn " << fn.name
+        clearProgressLine(); std::cerr << red("error: ") << loc() << "fn " << fn.name
                   << " expects " << fn.params.size()
                   << " args, got " << args.size() << "\n";
         if (args.size() < fn.params.size()) {
@@ -267,7 +457,7 @@ FnResult Interpreter::execFn(const FnStmt& fn, Env env,
         std::string varname = "__val_" + std::to_string(fn_depth) + "_" + param;
         std::string err = dbExec("SET VARIABLE " + varname + " = " + value_expr);
         if (!err.empty()) {
-            std::cerr << red("error: ") << loc()
+            clearProgressLine(); std::cerr << red("error: ") << loc()
                       << "fn " << fn.name << " param " << param << ": " << err << "\n";
         } else {
             result.vars_to_reset.push_back(varname);  // defer, not val_scopes
@@ -284,7 +474,7 @@ FnResult Interpreter::execFn(const FnStmt& fn, Env env,
 
             std::string inner_fn; std::vector<std::string> inner_args;
             if (isFunctionCall(sql, inner_fn, inner_args) && functions.count(inner_fn)) {
-                FnResult inner = execFn(functions[inner_fn], env, inner_args);
+                FnResult inner = execFn(functions[inner_fn], env, inner_args, raw);
                 for (auto& cte : inner.ctes) result.ctes.push_back(cte);
                 if (!inner.select.empty())
                     result.ctes.push_back({let->name, inner.select});
@@ -295,7 +485,7 @@ FnResult Interpreter::execFn(const FnStmt& fn, Env env,
         } else if (auto* val = std::get_if<ValStmt>(&n->node)) {
             // val inside a function: evaluate immediately and inject into env
             // so subsequent CTEs in this function can reference it via {{name}}
-            exec(*val, env);
+            exec(*val, env, raw);
 
         } else if (auto* stmt = std::get_if<SQLStmt>(&n->node)) {
             std::string sql = trim(resolve(stmt->sql, env));
@@ -306,10 +496,10 @@ FnResult Interpreter::execFn(const FnStmt& fn, Env env,
             if (upper.rfind("SELECT", 0) == 0) {
                 result.select = sql;
             } else {
-                exec(*stmt, env);
+                exec(*stmt, env, raw);
             }
         } else {
-            std::visit([&](auto&& x){ exec(x, env); }, n->node);
+            std::visit([&](auto&& x){ exec(x, env, raw); }, n->node);
         }
     }
 
@@ -326,32 +516,51 @@ FnResult Interpreter::execFn(const FnStmt& fn, Env env,
 
 // ====================== LET ======================
 
-void Interpreter::exec(const LetStmt& s, Env& env) {
+void Interpreter::exec(const LetStmt& s, Env& env, RawEnv& raw) {
     std::string sql = trim(resolve(s.sql, env));
 
     std::string fn_name; std::vector<std::string> fn_args;
     if (isFunctionCall(sql, fn_name, fn_args) && functions.count(fn_name)) {
-        FnResult r = execFn(functions[fn_name], env, fn_args);
+        FnResult r = execFn(functions[fn_name], env, fn_args, raw);
         std::string built = r.build();
         if (!built.empty()) {
             std::string full = "CREATE OR REPLACE TEMP TABLE " + s.name + " AS (" + built + ")";
             std::string err = dbExec(full);
             for (auto& v : r.vars_to_reset) dbExec("RESET VARIABLE " + v);
             if (!err.empty()) {
-                std::cerr << red("error: ") << loc() << "let " << s.name << " = " << fn_name << "(): " << err << "\n";
+                clearProgressLine(); std::cerr << red("error: ") << loc() << "let " << s.name << " = " << fn_name << "(): " << err << "\n";
                 return;
             }
+            known_tables.insert(s.name);
             if (verbose) std::cout << dim("✓ let " + s.name + " = " + fn_name + "()") << "\n";
         }
         return;
     }
 
+    // If the RHS doesn't start with a SQL query keyword, wrap in SELECT * FROM.
+    // This lets you write:
+    //   let data   = read_csv('mydata.csv')
+    //   let events = read_parquet('s3://bucket/*.parquet')
+    // instead of the more verbose SELECT * FROM form.
+    std::string upper_sql = sql;
+    std::transform(upper_sql.begin(), upper_sql.end(), upper_sql.begin(),
+                   [](unsigned char c){ return std::toupper(c); });
+    static const std::vector<std::string> query_starts = {
+        "SELECT", "WITH", "FROM", "VALUES", "TABLE"
+    };
+    bool is_query = false;
+    for (const auto& kw : query_starts) {
+        if (upper_sql.rfind(kw, 0) == 0) { is_query = true; break; }
+    }
+    if (!is_query) sql = "SELECT * FROM (" + sql + ")";
+
     std::string full = "CREATE OR REPLACE TEMP TABLE " + s.name + " AS " + sql;
     std::string err = dbExec(full);
     if (!err.empty()) {
-        std::cerr << red("error: ") << loc() << "let " << s.name << ": " << err << "\n";
+        clearProgressLine(); std::cerr << red("error: ") << loc() << "let " << s.name << ": " << err << "\n";
         return;
     }
+    known_tables.insert(s.name);
     if (verbose) std::cout << dim("✓ let " + s.name) << "\n";
 }
 
@@ -361,7 +570,7 @@ void Interpreter::exec(const LetStmt& s, Env& env) {
 // extracts the first cell, and stores the result as a plain string in env.
 // Subsequent statements in the same block see it via {{name}} or bare name.
 
-void Interpreter::exec(const ValStmt& s, Env& env) {
+void Interpreter::exec(const ValStmt& s, Env& env, RawEnv& raw) {
     std::string expr = trim(resolve(s.expr, env));
 
     // Use DuckDB SET VARIABLE so the value is stored with its original type
@@ -384,7 +593,13 @@ void Interpreter::exec(const ValStmt& s, Env& env) {
     } else if (upper.find(" FROM ") != std::string::npos) {
         value_expr = "(SELECT " + expr + ")";
     } else {
-        value_expr = "(SELECT (" + expr + "))";
+        // No FROM — try to infer it from known tables
+        std::string inferred = inferFrom(expr);
+        if (inferred != expr) {
+            value_expr = "(SELECT " + inferred + ")";
+        } else {
+            value_expr = "(SELECT (" + expr + "))";
+        }
     }
 
     // Scope-prefix the variable name so function-local vals never collide
@@ -393,7 +608,7 @@ void Interpreter::exec(const ValStmt& s, Env& env) {
     std::string set_sql = "SET VARIABLE " + varname + " = " + value_expr;
     std::string err = dbExec(set_sql);
     if (!err.empty()) {
-        std::cerr << red("error: ") << loc() << "val " << s.name << ": " << err << "\n";
+        clearProgressLine(); std::cerr << red("error: ") << loc() << "val " << s.name << ": " << err << "\n";
         return;
     }
 
@@ -404,21 +619,23 @@ void Interpreter::exec(const ValStmt& s, Env& env) {
     // everywhere, including as a macro/extension parameter.
     env[s.name] = "getvariable('" + varname + "')";
 
-    if (verbose) {
-        // Use CAST to VARCHAR so any type — including arrays, structs, maps —
-        // renders correctly. duckdb_value_varchar only handles scalar types.
+    // Fetch the actual string value for {{name}} raw injection.
+    // CAST to VARCHAR handles all types including arrays and structs.
+    {
         duckdb_result res;
         dbExec("SELECT CAST(getvariable('" + varname + "') AS VARCHAR)", &res);
         char* v = duckdb_value_varchar(&res, 0, 0);
-        std::cout << dim("✓ val " + s.name + " = " + (v ? v : "NULL")) << "\n";
+        std::string raw_val = v ? v : "";
         if (v) duckdb_free(v);
         duckdb_destroy_result(&res);
+        raw[s.name] = raw_val;
+        if (verbose) std::cout << dim("✓ val " + s.name + " = " + raw_val) << "\n";
     }
 }
 
 // ====================== FOR =======================
 
-void Interpreter::exec(const ForStmt& s, Env& env) {
+void Interpreter::exec(const ForStmt& s, Env& env, RawEnv& raw) {
     // Support both bare table names and inline queries as source.
     std::string source = trim(s.source);
     std::string upper = source;
@@ -431,7 +648,7 @@ void Interpreter::exec(const ForStmt& s, Env& env) {
     duckdb_result res;
     std::string err = dbExec(q, &res);
     if (!err.empty()) {
-        std::cerr << red("error: ") << loc() << "for " << s.var << " in " << s.source << ": " << err << "\n";
+        clearProgressLine(); std::cerr << red("error: ") << loc() << "for " << s.var << " in " << s.source << ": " << err << "\n";
         return;
     }
 
@@ -440,54 +657,71 @@ void Interpreter::exec(const ForStmt& s, Env& env) {
     if (verbose) std::cout << dim("→ for " + s.var) << "\n";
 
     for (idx_t r = 0; r < rows; r++) {
-        Env local = env;
+        if (show_progress && rows > 1) {
+            emitProgress("for " + s.var, (int)r + 1, (int)rows);
+        }
+        Env    local     = env;
+        RawEnv local_raw = raw;
         for (idx_t c = 0; c < cols; c++) {
             char* val = duckdb_value_varchar(&res, c, r);
-            local[s.var + "." + duckdb_column_name(&res, c)] = val ? val : "NULL";
+            std::string col   = duckdb_column_name(&res, c);
+            std::string value = val ? val : "NULL";
+            local[s.var + "." + col]     = value;
+            local_raw[s.var + "." + col] = value;
             if (val) duckdb_free(val);
         }
-        execBlock(s.body, local);
+        // Single-column source: bind the bare var name directly.
+        // "for name in customers.name:" -> use `name` not `name.name`
+        if (cols == 1) {
+            char* sv = duckdb_value_varchar(&res, 0, r);
+            std::string sv_val = sv ? sv : "NULL";
+            local[s.var]     = sv_val;
+            local_raw[s.var] = sv_val;
+            if (sv) duckdb_free(sv);
+        }
+        execBlock(s.body, local, local_raw);
     }
+    if (show_progress && rows > 1) clearProgressLine();
     duckdb_destroy_result(&res);
 }
 
-// ====================== IF / WHILE ======================
+// ====================== IF / WHILE =======================
 
-void Interpreter::exec(const IfStmt& s, Env& env) {
+void Interpreter::exec(const IfStmt& s, Env& env, RawEnv& raw) {
     if (evalCond(s.cond, env)) {
-        execBlock(s.thenb, env);
+        execBlock(s.thenb, env, raw);
     } else {
-        execBlock(s.elseb, env);
+        execBlock(s.elseb, env, raw);
     }
 }
 
-void Interpreter::exec(const WhileStmt& s, Env& env) {
+void Interpreter::exec(const WhileStmt& s, Env& env, RawEnv& raw) {
     if (verbose) std::cout << dim("→ while") << "\n";
     while (evalCond(s.cond, env)) {
-        execBlock(s.body, env);
+        execBlock(s.body, env, raw);
     }
 }
 
 // ====================== EXPECT ======================
 
-void Interpreter::exec(const ExpectStmt& s, Env& env) {
+void Interpreter::exec(const ExpectStmt& s, Env& env, RawEnv& raw) {
     if (!evalCond(s.condition, env)) {
         std::string msg = s.message.empty()
             ? "expectation failed: " + s.condition
             : s.message;
 
         if (s.action == "fail") {
-            std::cerr << red("❌ fail: ") << loc() << msg << "\n";
+            clearProgressLine(); std::cerr << red("❌ fail: ") << loc() << msg << "\n";
             std::exit(1);
         } else {
-            std::cerr << yellow("⚠️  warn: ") << loc() << msg << "\n";
+            clearProgressLine(); std::cerr << yellow("⚠️  warn: ") << loc() << msg << "\n";
         }
     }
 }
 
 // ====================== PRINT ======================
 
-void Interpreter::exec(const PrintStmt& s, Env& env) {
+void Interpreter::exec(const PrintStmt& s, Env& env, RawEnv& raw) {
     std::string text = trim(resolve(s.text, env));
 
     std::string upper = text;
@@ -499,7 +733,7 @@ void Interpreter::exec(const PrintStmt& s, Env& env) {
         duckdb_result res;
         std::string err = dbExec(text, &res);
         if (!err.empty()) {
-            std::cerr << red("error: ") << loc() << "print: " << err << "\n";
+            clearProgressLine(); std::cerr << red("error: ") << loc() << "print: " << err << "\n";
             duckdb_destroy_result(&res);
             return;
         }
@@ -539,7 +773,7 @@ void Interpreter::exec(const PrintStmt& s, Env& env) {
 
 // ====================== IMPORT ======================
 
-void Interpreter::exec(const ImportStmt& s, Env& env) {
+void Interpreter::exec(const ImportStmt& s, Env& env, RawEnv& raw) {
     std::filesystem::path base = file_stack.empty()
         ? std::filesystem::current_path()
         : std::filesystem::path(file_stack.back()).parent_path();
@@ -547,7 +781,7 @@ void Interpreter::exec(const ImportStmt& s, Env& env) {
     std::filesystem::path filepath = std::filesystem::weakly_canonical(base / s.filename);
 
     if (!std::filesystem::exists(filepath)) {
-        std::cerr << red("error: ") << loc() << "cannot open import '" << filepath.string() << "'\n";
+        clearProgressLine(); std::cerr << red("error: ") << loc() << "cannot open import '" << filepath.string() << "'\n";
         return;
     }
 
@@ -559,7 +793,7 @@ void Interpreter::exec(const ImportStmt& s, Env& env) {
 
     Parser subparser(buf.str());
     auto subast = subparser.parseBlock();
-    execBlock(subast, env);
+    execBlock(subast, env, raw);
 
     file_stack.pop_back();
     if (verbose) std::cout << dim("✓ imported " + filepath.string()) << "\n";
@@ -567,7 +801,7 @@ void Interpreter::exec(const ImportStmt& s, Env& env) {
 
 // ====================== SQL ======================
 
-void Interpreter::exec(const SQLStmt& s, Env& env) {
+void Interpreter::exec(const SQLStmt& s, Env& env, RawEnv& raw) {
     std::string sql = trim(resolve(s.sql, env));
     if (sql.empty()) return;
 
@@ -590,7 +824,7 @@ void Interpreter::exec(const SQLStmt& s, Env& env) {
     std::string fn_name; std::vector<std::string> fn_args;
     if (isFunctionCall(sql, fn_name, fn_args) && functions.count(fn_name)) {
         if (verbose) std::cout << dim("→ calling " + fn_name + "()") << "\n";
-        FnResult r = execFn(functions[fn_name], env, fn_args);
+        FnResult r = execFn(functions[fn_name], env, fn_args, raw);
         std::string built = r.build();
         if (built.empty()) return;
 
@@ -599,17 +833,17 @@ void Interpreter::exec(const SQLStmt& s, Env& env) {
                                    "' (FORMAT CSV, HEADER" + (s.append ? ", APPEND" : "") + ")";
             std::string err = dbExec(copy_sql);
             for (auto& v : r.vars_to_reset) dbExec("RESET VARIABLE " + v);
-            if (!err.empty())
-                std::cerr << red("error: ") << loc() << "export " << fn_name << "(): " << err << "\n";
-            else if (verbose)
+            if (!err.empty()) {
+                clearProgressLine(); std::cerr << red("error: ") << loc() << "export " << fn_name << "(): " << err << "\n";
+            } else if (verbose)
                 std::cout << dim("→ exported to " + s.redirect_file) << "\n";
         } else {
             duckdb_result res;
             std::string err = dbExec(built, &res);
             for (auto& v : r.vars_to_reset) dbExec("RESET VARIABLE " + v);
-            if (!err.empty())
-                std::cerr << red("error: ") << loc() << fn_name << "(): " << err << "\n";
-            else
+            if (!err.empty()) {
+                clearProgressLine(); std::cerr << red("error: ") << loc() << fn_name << "(): " << err << "\n";
+            } else
                 printResult(&res);
             duckdb_destroy_result(&res);
         }
@@ -621,9 +855,9 @@ void Interpreter::exec(const SQLStmt& s, Env& env) {
         std::string copy_sql = "COPY (" + sql + ") TO '" + s.redirect_file +
                                "' (FORMAT CSV, HEADER" + (s.append ? ", APPEND" : "") + ")";
         std::string err = dbExec(copy_sql);
-        if (!err.empty())
-            std::cerr << red("error: ") << loc() << "export: " << err << "\n";
-        else if (verbose)
+        if (!err.empty()) {
+            clearProgressLine(); std::cerr << red("error: ") << loc() << "export: " << err << "\n";
+        } else if (verbose)
             std::cout << dim("→ exported to " + s.redirect_file) << "\n";
         return;
     }
@@ -632,7 +866,7 @@ void Interpreter::exec(const SQLStmt& s, Env& env) {
     duckdb_result res;
     std::string err = dbExec(sql, &res);
     if (!err.empty()) {
-        std::cerr << red("error: ") << loc() << err << "\n";
+        clearProgressLine(); std::cerr << red("error: ") << loc() << err << "\n";
         duckdb_destroy_result(&res);
         return;
     }

@@ -22,5 +22,6 @@ private:
     ASTPtr parseFn(int baseIndent);
     ASTPtr parsePrint();
     ASTPtr parseImport();
+    ASTPtr parseProjection(int baseIndent);
     ASTPtr parseRawSQL(int baseIndent);
 };

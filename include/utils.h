@@ -6,5 +6,9 @@
 void check(duckdb_state s, const char* msg);
 std::string trim(const std::string& s);
 int indentLevel(const std::string& line);
-std::string replaceAll(std::string s, const std::unordered_map<std::string,std::string>& env);
+// env: bare name substitution (getvariable() fragments)
+// raw: {{name}} substitution (actual string values for SQL construction)
+std::string replaceAll(std::string s,
+    const std::unordered_map<std::string,std::string>& env,
+    const std::unordered_map<std::string,std::string>& raw = {});
 std::string replaceEnvVars(const std::string& s);

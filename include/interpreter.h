@@ -2,18 +2,16 @@
 #include "ast.h"
 #include "duckdb.h"
 #include <unordered_map>
+#include <set>
 #include <vector>
 #include <string>
 
 // Returned by execFn — a self-contained CTE chain + final SELECT.
-// Callers either materialize it into a temp table (let x = fn())
-// or execute and print it (standalone fn()).
 struct FnResult {
-    std::vector<std::pair<std::string,std::string>> ctes;  // name → sql
+    std::vector<std::pair<std::string,std::string>> ctes;
     std::string select;
-    std::vector<std::string> vars_to_reset;  // param variables — reset AFTER caller materializes
+    std::vector<std::string> vars_to_reset;
 
-    // Build a single self-contained SQL string: WITH ... SELECT ...
     std::string build() const {
         if (select.empty()) return "";
         if (ctes.empty()) return select;
@@ -29,46 +27,63 @@ struct FnResult {
 class Interpreter {
     duckdb_connection conn;
     bool verbose;
+
+    // ── progress ──────────────────────────────────────────────
+    bool show_progress  = false;
+    bool progress_is_tty = false;   // true → human bar, false → machine lines
+    int  total_stmts    = 0;        // set in run() from AST size
+    int  current_stmt   = 0;        // incremented in execBlock (top-level only)
+    bool progress_line_active = false;  // true if \r line is on stderr, needs clearing
+
+    // Emit a progress event.
+    // Human (tty):    \r[=====>   ] 12/47 label
+    // Machine (!tty): PROGRESS 12/47 label\n
+    void emitProgress(const std::string& label, int cur = -1, int tot = -1);
+
+    // Clear the current \r progress line before writing errors/warnings.
+    // No-op in machine mode or when no line is active.
+    void clearProgressLine();
+
+    // ── state ─────────────────────────────────────────────────
     std::unordered_map<std::string, FnStmt> functions;
-    std::vector<std::string> file_stack;   // for relative import resolution
-    int current_line = 0;                  // updated in execBlock, used in errors
-    int fn_depth = 0;                          // incremented on each execFn entry
-    std::vector<std::vector<std::string>> val_scopes = {{}};  // per-scope list of __val_ tables to drop on exit
+    std::unordered_map<std::string, std::string> projections;
+    std::vector<std::string> file_stack;
+    int current_line = 0;
+    int fn_depth     = 0;
+    std::set<std::string> known_tables;
+    std::vector<std::vector<std::string>> val_scopes = {{}};
 
 public:
-    Interpreter(duckdb_connection c, bool verbose = false);
-    // source_file is used to resolve relative imports; pass the script path from main.
+    Interpreter(duckdb_connection c, bool verbose = false, bool progress = false);
     void run(const std::vector<ASTPtr>& prog, const std::string& source_file = "");
 
 private:
-    using Env = std::unordered_map<std::string,std::string>;
+    using Env    = std::unordered_map<std::string,std::string>;
+    using RawEnv = std::unordered_map<std::string,std::string>;
 
-    void execBlock(const std::vector<ASTPtr>& block, Env env);
-    FnResult execFn(const FnStmt& fn, Env env, const std::vector<std::string>& args = {});
+    void execBlock(const std::vector<ASTPtr>& block, Env env, RawEnv raw = {},
+                   bool top_level = false);
+    FnResult execFn(const FnStmt& fn, Env env,
+                    const std::vector<std::string>& args = {}, RawEnv raw = {});
 
-    void exec(const LetStmt& s, Env& env);
-    void exec(const ValStmt& s, Env& env);
-    void exec(const ForStmt& s, Env& env);
-    void exec(const IfStmt& s, Env& env);
-    void exec(const WhileStmt& s, Env& env);
-    void exec(const ExpectStmt& s, Env& env);
-    void exec(const FnStmt& s, Env& env);
-    void exec(const SQLStmt& s, Env& env);
-    void exec(const PrintStmt& s, Env& env);
-    void exec(const ImportStmt& s, Env& env);
+    void exec(const LetStmt& s,        Env& env, RawEnv& raw);
+    void exec(const ValStmt& s,        Env& env, RawEnv& raw);
+    void exec(const ForStmt& s,        Env& env, RawEnv& raw);
+    void exec(const IfStmt& s,         Env& env, RawEnv& raw);
+    void exec(const WhileStmt& s,      Env& env, RawEnv& raw);
+    void exec(const ExpectStmt& s,     Env& env, RawEnv& raw);
+    void exec(const FnStmt& s,         Env& env, RawEnv& raw);
+    void exec(const SQLStmt& s,        Env& env, RawEnv& raw);
+    void exec(const PrintStmt& s,      Env& env, RawEnv& raw);
+    void exec(const ImportStmt& s,     Env& env, RawEnv& raw);
+    void exec(const ProjectionStmt& s, Env& env, RawEnv& raw);
 
     bool evalCond(std::string cond, Env& env);
-    bool isFunctionCall(const std::string& sql, std::string& fn_name, std::vector<std::string>& args);
+    bool isFunctionCall(const std::string& sql, std::string& fn_name,
+                        std::vector<std::string>& args);
     void printResult(duckdb_result* res);
-
-    // Apply env substitution + env var expansion in one call
-    std::string resolve(const std::string& sql, const Env& env);
-
-    // Format "filename:line: " prefix for error messages.
-    // Works for both the root script and imported files.
+    std::string resolve(const std::string& sql, const Env& env, const RawEnv& raw = {});
+    std::string inferFrom(const std::string& expr);
     std::string loc() const;
-
-    // Run a DuckDB query and return the error string on failure, "" on success.
-    // Always pass a result so we can retrieve the error message.
     std::string dbExec(const std::string& sql, duckdb_result* res = nullptr);
 };

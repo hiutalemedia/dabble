@@ -142,6 +142,11 @@ Dabble scripts are plain `.sql` files — VS Code syntax highlighting works out 
 Materialises a query into a DuckDB temp table. Lives for the duration of the script.
 
 ```sql
+-- Table functions work directly without SELECT * FROM:
+let data   = read_csv('mydata.csv')
+let events = read_parquet('s3://bucket/events/*.parquet')
+
+-- Full queries still work as before:
 let paid  = SELECT * FROM orders WHERE status = 'paid'
 let report =
     SELECT o.*, p.name, p.category
@@ -209,21 +214,54 @@ paid_summary()
 
 ---
 
+
+### Projections — `projection` / `proj` / `cols` / `columns`
+
+A named, reusable column list. Spread anywhere in a SELECT with `...name`.
+
+```sql
+projection deal_core =
+    deal_id,
+    rep_name,
+    ROUND(amount, 2) AS amount,
+    close_date
+
+proj metrics =
+    ROUND(margin_pct, 1) AS margin_pct,
+    deal_tier,
+    is_won
+
+-- Spread into any query:
+let report = SELECT ...deal_core, region FROM enriched ORDER BY close_date
+
+-- Combine multiple projections:
+let full = SELECT ...deal_core, ...metrics FROM enriched
+
+-- Mix with other columns:
+let export = SELECT ...deal_core, product_category, team
+    FROM enriched WHERE is_won = 1
+```
+
+All four keywords are aliases — use whichever reads best in context.
+Projection column lists can reference `{{vars}}` which are resolved at definition time.
+
+---
+
 ### For loops — `for`
 
 Iterates over every row of a table or inline query.
 
 ```sql
 for c in customers:
-    print c.name || ' — $' || c.total_spent
+    print '{{c.name}} — ${{c.total_spent}}'
 
--- Inline query as source:
+-- table.column shorthand — single-column, var IS the value:
+for name in customers.name:
+    print name
+
+-- Inline query:
 for row in (SELECT category, SUM(revenue) AS rev FROM summary GROUP BY category):
-    print row.category || ': $' || ROUND(row.rev, 2)
-
--- Large files work too:
-for row in (SELECT * FROM read_parquet('events/*.parquet')):
-    print row.event_type || ': ' || row.ts
+    print '{{row.category}}: $' || ROUND(row.rev, 2)
 ```
 
 ---
@@ -243,6 +281,13 @@ else:
 -- These are equivalent:
 if (COUNT(*) > 0 FROM orders WHERE status = 'pending'):
 if (SELECT COUNT(*) > 0 FROM orders WHERE status = 'pending'):
+
+-- FROM can be omitted if the column exists in exactly one known let-table:
+let paid = SELECT * FROM orders WHERE status = 'paid'
+val total = SUM(amount)   -- Dabble finds 'amount' uniquely in 'paid'
+if (total > 1000):        -- total is a scalar, no FROM needed
+if (COUNT(*) > 5):        -- COUNT needs no column, won't auto-infer FROM
+if (SUM(amount) > 1000):  -- 'amount' found in 'paid' → FROM paid inferred
 ```
 
 ---
@@ -267,6 +312,8 @@ while (offset < (SELECT COUNT(*) FROM events)):
 Data quality assertions. `fail` exits immediately with a red error. `warn` prints a yellow warning and continues.
 
 ```sql
+-- check and expect are aliases:
+check  (COUNT(*) > 0 FROM paid)              else fail 'no paid orders found'
 expect (COUNT(*) > 0 FROM paid)              else fail 'no paid orders found'
 expect (COUNT(*) = 0 FROM dupes)             else fail 'duplicate order IDs detected'
 expect (SUM(amount) > 0 FROM ledger)         else warn 'ledger total is zero'
@@ -333,9 +380,37 @@ FROM paid
 Redirect any query to a CSV file.
 
 ```sql
-SELECT * FROM summary ORDER BY revenue DESC > report.csv
-SELECT * FROM errors >> error_log.csv       -- append
+SELECT * FROM summary ORDER BY revenue DESC -> report.csv
+SELECT * FROM errors >> error_log.csv        -- append
 ```
+
+---
+
+
+### CLI arguments & environment variables
+
+Pass `key=value` pairs after the script path — they become environment variables accessible via `env.key`:
+
+```bash
+dabble pipeline.dabble month=2026-04 region=EMEA min_deal=1000
+dabble report.dabble env=prod
+```
+
+Inside the script:
+
+```sql
+-- Read CLI arg, fall back to default with COALESCE
+val month      = COALESCE(TRY_CAST(env.month AS DATE), CURRENT_DATE)
+val region     = env.region          -- empty string if not passed
+val min_amount = COALESCE(TRY_CAST(env.min_deal AS INTEGER), 500)
+
+-- Use directly in queries:
+let deals = SELECT * FROM orders
+    WHERE close_date >= month
+    AND (region = '' OR UPPER(area) = UPPER(region))
+```
+
+System environment variables work the same way — `env.HOME`, `env.PATH`, `env.MY_SECRET` etc. CLI args take precedence over existing env vars since `setenv` is called with overwrite=1.
 
 ---
 
@@ -346,17 +421,6 @@ Runs another `.sql` file in the current context. Paths resolve relative to the i
 ```sql
 import "lib/helpers.sql"
 import "setup.sql"
-```
-
----
-
-### Persistent Data
-
-Just add attach. Dabble support what Duckdb spports.
-
-```sql
-ATTACH 'test.duckdb' as my_db;
-USE my_db;
 ```
 
 ---
@@ -457,8 +521,10 @@ A few things worth noticing:
 
 ## Roadmap / known gaps
 
+- [ ] Function parameters
 - [ ] Better indentation handling (currently hardcoded 4 spaces)
-- [ ] `return` keyword for early exit from functions (return is currently last select statement)
+- [ ] `return` keyword for early exit from functions
+- [ ] Persistent database support (currently in-memory only)
 - [ ] Package/module system beyond `import`
 
 ---
