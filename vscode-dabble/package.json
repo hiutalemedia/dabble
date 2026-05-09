@@ -1,0 +1,30 @@
+{
+  "name": "dabble",
+  "displayName": "Dabble",
+  "description": "Syntax highlighting for Dabble — a scripting layer for DuckDB",
+  "version": "0.1.0",
+  "publisher": "dabble",
+  "engines": { "vscode": "^1.75.0" },
+  "categories": ["Programming Languages"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourname/dabble"
+  },
+  "contributes": {
+    "languages": [
+      {
+        "id": "dabble",
+        "aliases": ["Dabble", "dabble"],
+        "extensions": [".dabble"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "dabble",
+        "scopeName": "source.dabble",
+        "path": "./syntaxes/dabble.tmLanguage.json"
+      }
+    ]
+  }
+}

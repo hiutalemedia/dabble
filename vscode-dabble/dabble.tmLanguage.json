@@ -1,0 +1,112 @@
+{
+  "name": "Dabble",
+  "scopeName": "source.dabble",
+  "fileTypes": ["dabble"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#template_vars" },
+    { "include": "#dabble_keywords" },
+    { "include": "#export_operator" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#sql_keywords" },
+    { "include": "#sql_functions" },
+    { "include": "#operators" }
+  ],
+  "repository": {
+
+    "comments": {
+      "name": "comment.line.double-dash.dabble",
+      "match": "--.*$"
+    },
+
+    "template_vars": {
+      "name": "meta.template.dabble",
+      "match": "(\\{\\{)([^}]+)(\\}\\})",
+      "captures": {
+        "1": { "name": "punctuation.definition.template.begin.dabble" },
+        "2": { "name": "variable.other.template.dabble" },
+        "3": { "name": "punctuation.definition.template.end.dabble" }
+      }
+    },
+
+    "dabble_keywords": {
+      "patterns": [
+        {
+          "comment": "block starters — get prominent color",
+          "name": "keyword.control.dabble",
+          "match": "\\b(for|while|if|else|fn)\\b"
+        },
+        {
+          "comment": "variable binding",
+          "name": "keyword.other.binding.dabble",
+          "match": "\\b(let|val|scalar|table)\\b"
+        },
+        {
+          "comment": "validation",
+          "name": "keyword.other.validation.dabble",
+          "match": "\\b(expect|check)\\b"
+        },
+        {
+          "comment": "expect/check modifiers",
+          "name": "keyword.other.modifier.dabble",
+          "match": "\\b(else\\s+fail|else\\s+warn)\\b"
+        },
+        {
+          "comment": "io",
+          "name": "keyword.other.io.dabble",
+          "match": "\\b(print|import|in)\\b"
+        }
+      ]
+    },
+
+    "export_operator": {
+      "patterns": [
+        {
+          "name": "keyword.operator.export.append.dabble",
+          "match": ">>"
+        },
+        {
+          "name": "keyword.operator.export.dabble",
+          "match": "->"
+        }
+      ]
+    },
+
+    "strings": {
+      "name": "string.quoted.single.dabble",
+      "begin": "'",
+      "end": "'",
+      "patterns": [
+        {
+          "name": "constant.character.escape.dabble",
+          "match": "''"
+        },
+        {
+          "include": "#template_vars"
+        }
+      ]
+    },
+
+    "numbers": {
+      "name": "constant.numeric.dabble",
+      "match": "\\b([0-9]+(\\.[0-9]+)?)\\b"
+    },
+
+    "sql_keywords": {
+      "name": "keyword.other.sql.dabble",
+      "match": "(?i)\\b(SELECT|FROM|WHERE|JOIN|LEFT|RIGHT|INNER|OUTER|FULL|CROSS|ON|AND|OR|NOT|IN|IS|NULL|AS|BY|GROUP|ORDER|HAVING|LIMIT|OFFSET|DISTINCT|UNION|EXCEPT|INTERSECT|WITH|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|TABLE|TEMP|TEMPORARY|VIEW|INDEX|INTO|VALUES|SET|CASE|WHEN|THEN|ELSE|END|EXISTS|BETWEEN|LIKE|ILIKE|ATTACH|DETACH|USE|INSTALL|LOAD|COPY|FORMAT|HEADER|ASC|DESC|OVER|PARTITION|WINDOW|QUALIFY|SAMPLE|RETURNING)\\b"
+    },
+
+    "sql_functions": {
+      "name": "support.function.sql.dabble",
+      "match": "(?i)\\b(COUNT|SUM|AVG|MIN|MAX|ROUND|FLOOR|CEIL|ABS|COALESCE|NULLIF|IFNULL|IIF|CAST|TRY_CAST|TYPEOF|DATE_PART|DATE_TRUNC|NOW|TODAY|CURRENT_DATE|CURRENT_TIMESTAMP|EPOCH|STRFTIME|STRPTIME|LENGTH|UPPER|LOWER|TRIM|LTRIM|RTRIM|SUBSTR|SUBSTRING|REPLACE|SPLIT|STRING_AGG|LIST_AGG|ARRAY_AGG|ROW_NUMBER|RANK|DENSE_RANK|LAG|LEAD|FIRST_VALUE|LAST_VALUE|NTILE|GETVARIABLE|READ_CSV|READ_PARQUET|READ_JSON)\\s*(?=\\()"
+    },
+
+    "operators": {
+      "name": "keyword.operator.dabble",
+      "match": "(\\|\\||!=|<>|<=|>=|<|>|=|\\+|-|\\*|\\/|%|::)"
+    }
+
+  }
+}
