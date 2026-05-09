@@ -1,0 +1,298 @@
+-- ============================================================
+-- features_test.dabble
+--
+-- Tests all Dabble features without external files.
+-- Uses inline VALUES for all data.
+-- Run: dabble features_test.dabble
+-- Deps: dabble --deps features_test.dabble
+-- ============================================================
+
+print '════════════════════════════════════════'
+print ' Dabble Feature Test'
+print '════════════════════════════════════════'
+
+-- ── 1. INLINE DATA ───────────────────────────────────────────
+
+print ''
+print '── 1. Inline data ──'
+
+let products = SELECT * FROM (VALUES
+    (1, 'Keyboard',   'electronics', 79.99,  12.00),
+    (2, 'Mouse',      'electronics', 29.99,   5.00),
+    (3, 'Coffee',     'food',         9.99,   2.00),
+    (4, 'Notebook',   'stationery',   4.99,   0.80),
+    (5, 'Headphones', 'electronics', 149.99, 40.00),
+    (6, 'Tea',        'food',         7.99,   1.50),
+    (7, 'Pen',        'stationery',   1.99,   0.30),
+    (8, 'Monitor',    'electronics', 399.99, 95.00)
+    ) AS t(id, name, category, price, cost);
+
+let orders = SELECT * FROM (VALUES
+    (1,  1, 'alice',   2, 'paid'),
+    (2,  3, 'bob',     5, 'paid'),
+    (3,  5, 'alice',   1, 'refunded'),
+    (4,  2, 'carol',   3, 'paid'),
+    (5,  8, 'bob',     1, 'pending'),
+    (6,  4, 'carol',  10, 'paid'),
+    (7,  6, 'alice',   4, 'paid'),
+    (8,  7, 'dave',   20, 'paid'),
+    (9,  1, 'dave',    1, 'paid'),
+    (10, 3, 'carol',   2, 'refunded')
+    ) AS t(id, product_id, customer, qty, status);
+
+print SELECT 'products: ' || COUNT(*) FROM products
+print SELECT 'orders:   ' || COUNT(*) FROM orders
+
+-- ── 2. LET / TABLE ───────────────────────────────────────────
+
+print ''
+print '── 2. let / table ──'
+
+let paid = SELECT o.*, p.name AS product_name, p.category, p.price, p.cost
+    FROM orders o
+    JOIN products p ON p.id = o.product_id
+    WHERE o.status = 'paid';
+
+table electronics = SELECT * FROM paid WHERE category = 'electronics';
+
+print SELECT 'paid orders: ' || COUNT(*) FROM paid
+print SELECT 'electronics: ' || COUNT(*) FROM electronics
+
+-- ── 3. VAL / SCALAR ──────────────────────────────────────────
+
+print ''
+print '── 3. val / scalar ──'
+
+val total_revenue  = SELECT ROUND(SUM(qty * price), 2) FROM paid
+val order_count    = COUNT(*) FROM orders
+val avg_order      = SELECT ROUND(AVG(qty * price), 2) FROM paid
+scalar currency    = '$'
+val threshold      = 100
+val report_date    = CURRENT_DATE
+val formatted_date = STRFTIME(CURRENT_DATE, '%Y-%m-%d')
+
+print 'Total revenue  : {{currency}}' || total_revenue
+print 'Order count    : ' || order_count
+print 'Average order  : {{currency}}' || avg_order
+print 'Threshold      : {{currency}}' || threshold
+print 'Report date    : ' || formatted_date
+
+-- ── 4. PROJECTIONS ───────────────────────────────────────────
+
+print ''
+print '── 4. projections ──'
+
+projection order_core =
+    product_name,
+    customer,
+    qty,
+    ROUND(qty * price, 2) AS line_total
+
+proj margin_cols =
+    ROUND(price - cost, 2)            AS unit_margin,
+    ROUND((price - cost) / price * 100, 1) AS margin_pct
+
+cols customer_stats =
+    customer,
+    COUNT(*)                      AS orders,
+    ROUND(SUM(qty * price), 2)    AS total_spent
+
+-- Use in queries
+let order_details = SELECT ...order_core FROM paid ORDER BY line_total DESC;
+let with_margins  = SELECT ...order_core, ...margin_cols FROM paid;
+let by_customer   = SELECT ...customer_stats FROM paid GROUP BY customer ORDER BY total_spent DESC;
+
+print 'Order details (top 3):'
+SELECT * FROM order_details LIMIT 3;
+
+print 'By customer:'
+by_customer
+
+-- ── 5. FUNCTIONS WITH PARAMS ─────────────────────────────────
+
+print ''
+print '── 5. functions with params ──'
+
+fn orders_for(status, min_qty):
+    let filtered = SELECT ...order_core
+        FROM paid
+        WHERE customer != 'N/A' AND qty >= min_qty
+    SELECT * FROM filtered ORDER BY line_total DESC
+
+fn category_revenue(cat):
+    let relevant = SELECT * FROM paid WHERE category = cat
+    SELECT
+        category,
+        COUNT(*)                       AS orders,
+        ROUND(SUM(qty * price), 2)     AS revenue,
+        ROUND(AVG(qty * price), 2)     AS avg_line
+    FROM relevant
+    GROUP BY category
+
+fn top_customers(limit_n):
+    let ranked = SELECT ...customer_stats
+        FROM paid GROUP BY customer
+    SELECT * FROM ranked ORDER BY total_spent DESC LIMIT limit_n
+
+-- Call with literals
+let big_paid = orders_for('paid', 3)
+print SELECT 'big paid orders (qty>=3): ' || COUNT(*) FROM big_paid
+big_paid
+
+-- Call with scalar
+val min_qty = 2
+let medium_paid = orders_for('paid', min_qty)
+print SELECT 'medium paid orders (qty>=' || min_qty || '): ' || COUNT(*) FROM medium_paid
+
+-- Standalone calls print directly
+print 'Electronics revenue:'
+category_revenue('electronics')
+
+print 'Food revenue:'
+category_revenue('food')
+
+print 'Top 3 customers:'
+top_customers(3)
+
+-- Materialise fn result, then export
+let top3 = top_customers(3)
+
+-- ── 6. FOR LOOPS ─────────────────────────────────────────────
+
+print ''
+print '── 6. for loops ──'
+
+-- Standard loop with column access
+print 'Customer breakdown:'
+for c in by_customer:
+    print '  {{c.customer}}: ' || c.orders || ' orders, $' || c.total_spent
+
+-- table.column shorthand — single column
+print 'Product names:'
+for name in products.name:
+    print '  - {{name}}'
+
+-- Inline query as source
+print 'Categories:'
+for row in (SELECT DISTINCT category FROM products ORDER BY category):
+    print '  {{row.category}}'
+
+-- ── 7. IF / ELSE / WHILE ─────────────────────────────────────
+
+print ''
+print '── 7. if / else / while ──'
+
+-- if with scalar comparison
+if (total_revenue > 500):
+    print 'Revenue target HIT: $' || total_revenue
+else:
+    print 'Revenue target MISSED: $' || total_revenue
+
+-- if with FROM inference
+if (SUM(qty) > 50 FROM paid):
+    print 'High volume: more than 50 units sold'
+else:
+    print 'Low volume'
+
+-- if with COUNT
+if (COUNT(*) > 0 FROM paid WHERE category = 'electronics'):
+    val elec_rev = SELECT ROUND(SUM(qty * price), 2) FROM paid WHERE category = 'electronics'
+    print 'Electronics revenue: $' || elec_rev
+else:
+    print 'No electronics sold'
+
+-- while with counter
+CREATE TEMP TABLE counter (n INTEGER);
+INSERT INTO counter VALUES (3);
+
+while (SELECT n > 0 FROM counter):
+    print SELECT '  countdown: ' || n FROM counter
+    UPDATE counter SET n = n - 1;
+
+print 'Done counting'
+
+-- ── 8. CHECK / EXPECT ────────────────────────────────────────
+
+print ''
+print '── 8. check / expect ──'
+
+check  (COUNT(*) > 0 FROM paid)                    else fail 'No paid orders'
+expect (COUNT(*) > 0 FROM products)                else fail 'No products'
+check  (total_revenue > 0)                         else fail 'Zero revenue'
+check  (COUNT(*) = 0 FROM orders WHERE status = 'unknown') else warn 'Unknown status values found'
+
+let dupes = SELECT id, COUNT(*) AS n FROM orders GROUP BY id HAVING n > 1;
+check  (COUNT(*) = 0 FROM dupes)                   else warn 'Duplicate order IDs'
+
+print 'All checks passed'
+
+-- ── 9. DYNAMIC SQL WITH INJECTION ────────────────────────────
+
+print ''
+print '── 9. dynamic SQL with {{}} injection ──'
+
+val col_name   = 'total_spent'
+val table_expr = 'by_customer'
+val condition  = 'total_spent > 100'
+
+-- {{}} injects raw string, bare name injects getvariable()
+print SELECT 'Customers where ' || '{{condition}}' || ':'
+SELECT customer, total_spent FROM {{table_expr}} WHERE {{condition}} ORDER BY total_spent DESC;
+
+-- Build column alias dynamically
+val metric_name = 'revenue_usd'
+let dynamic_agg = SELECT category, ROUND(SUM(qty * price), 2) AS metric
+    FROM paid GROUP BY category ORDER BY metric DESC;
+
+print 'Dynamic aggregation:'
+dynamic_agg
+
+-- ── 10. FROM INFERENCE ───────────────────────────────────────
+
+print ''
+print '── 10. FROM inference ──'
+
+-- 'category' exists uniquely in paid (via products join) — inferred
+val top_cat = SELECT category FROM paid GROUP BY category ORDER BY SUM(qty * price) DESC LIMIT 1
+print 'Top category: ' || top_cat
+
+-- 'customer' exists in paid — inferred
+if (SELECT COUNT(DISTINCT customer) >= 3 FROM paid):
+    print SELECT 'Good customer spread: ' || COUNT(DISTINCT customer) || ' customers' FROM paid
+else:
+    print 'Few customers'
+
+-- ── 11. EXPORT ───────────────────────────────────────────────
+
+print ''
+print '── 11. export ──'
+
+-- Named table shorthand export
+top3 -> /tmp/dabble_test_top_customers.csv
+by_customer -> /tmp/dabble_test_by_customer.csv
+
+-- Append mode
+SELECT 'test ran at ' || NOW() AS log_entry >> /tmp/dabble_test_log.csv
+
+print 'Exported to /tmp/dabble_test_*.csv'
+
+-- ── 12. MUTATIONS (for --deps tracking) ──────────────────────
+
+print ''
+print '── 12. mutations ──'
+
+CREATE TEMP TABLE audit_log (event VARCHAR, ts TIMESTAMP);
+INSERT INTO audit_log VALUES ('test_run', NOW());
+INSERT INTO audit_log VALUES ('export_done', NOW());
+
+print SELECT 'Audit log entries: ' || COUNT(*) FROM audit_log
+
+UPDATE audit_log SET event = UPPER(event);
+print SELECT 'After update: ' || event FROM audit_log LIMIT 1
+
+-- ── SUMMARY ──────────────────────────────────────────────────
+
+print ''
+print '════════════════════════════════════════'
+print SELECT ' All features OK — ' || NOW()
+print '════════════════════════════════════════'

@@ -6,10 +6,11 @@ Dabble is a lightweight scripting layer for DuckDB.
 
 It adds:
 - scalar and table variables
-- loops
-- functions
-- validation with `expect` syntax
-- control flow
+- loops and control flow
+- reusable functions
+- named column projections
+- data quality assertions
+- progress tracking
 
 …without leaving SQL.
 
@@ -21,104 +22,12 @@ DuckDB is still the engine you drive with. Dabble is just the gearbox that gives
 
 ---
 
-## Why
-
-A real data pipeline in Python looks something like this:
-
-```python
-import duckdb
-from datetime import date, timedelta
-
-conn = duckdb.connect()
-
-# Load and clean
-conn.execute("CREATE TEMP TABLE raw AS SELECT * FROM 'orders.parquet'")
-conn.execute("""
-    CREATE TEMP TABLE clean AS
-    SELECT * FROM raw
-    WHERE amount > 0 AND customer_id IS NOT NULL AND status != 'test'
-""")
-
-# Compute thresholds dynamically
-cutoff = date.today() - timedelta(days=30)
-avg_row = conn.execute("SELECT AVG(amount) FROM clean").fetchone()
-avg = avg_row[0]
-
-# Branch on results
-count_row = conn.execute(
-    f"SELECT COUNT(*) FROM clean WHERE created_at > '{cutoff}'"
-).fetchone()
-
-if count_row[0] == 0:
-    raise Exception("No recent orders — something is wrong")
-
-# Per-customer report
-customers = conn.execute("SELECT DISTINCT customer_id FROM clean").fetchall()
-for (cid,) in customers:
-    row = conn.execute(f"""
-        SELECT COUNT(*), SUM(amount)
-        FROM clean
-        WHERE customer_id = '{cid}' AND amount > {avg}
-    """).fetchone()
-    if row[0] > 0:
-        print(f"Customer {cid}: {row[0]} orders above average, total ${row[1]:.2f}")
-
-# Validate and export
-dup_row = conn.execute("""
-    SELECT COUNT(*) FROM (
-        SELECT order_id, COUNT(*) FROM clean GROUP BY order_id HAVING COUNT(*) > 1
-    )
-""").fetchone()
-if dup_row[0] > 0:
-    print(f"WARNING: {dup_row[0]} duplicate order IDs found")
-
-conn.execute(f"""
-    COPY (SELECT * FROM clean WHERE created_at > '{cutoff}' ORDER BY created_at DESC)
-    TO 'recent_orders.csv' (FORMAT CSV, HEADER)
-""")
-```
-
-The same pipeline in Dabble:
-
-```sql
--- Load and clean
-let raw   = SELECT * FROM 'orders.parquet'
-let clean = SELECT * FROM raw
-    WHERE amount > 0 AND customer_id IS NOT NULL AND status != 'test'
-
--- Compute thresholds
-val cutoff = CURRENT_DATE - INTERVAL 30 DAYS
-val avg    = SELECT AVG(amount) FROM clean
-
--- Validate recent data
-expect (COUNT(*) > 0 FROM clean WHERE created_at > cutoff)
-    else fail 'No recent orders — something is wrong'
-
--- Per-customer breakdown
-for c in (SELECT DISTINCT customer_id FROM clean):
-    let above = SELECT COUNT(*) AS cnt, SUM(amount) AS total
-        FROM clean WHERE customer_id = {{c.customer_id}} AND amount > avg
-    if (cnt > 0 FROM above):
-        print c.customer_id || ': ' || cnt || ' orders above average, total $' || ROUND(total, 2)
-
--- Warn on duplicates
-let dupes = SELECT order_id, COUNT(*) AS n FROM clean GROUP BY order_id HAVING n > 1
-expect (COUNT(*) = 0 FROM dupes) else warn 'duplicate order IDs found'
-
--- Export
-SELECT * FROM clean WHERE created_at > cutoff ORDER BY created_at DESC > recent_orders.csv
-```
-
-No dataframes. No string-interpolated SQL. No context switching. Just SQL with a script to run in.
-
----
-
 ## Install
 
 Requires CMake 3.20+ and a C++20 compiler. DuckDB is downloaded automatically.
 
 ```bash
-git clone https://github.com/yourname/dabble
+git clone https://github.com/hiutalemedia/dabble
 cd dabble
 cmake -B build
 cmake --build build -j
@@ -127,27 +36,35 @@ cmake --build build -j
 Run a script:
 
 ```bash
-./build/bin/dabble myscript.sql
-./build/bin/dabble --verbose myscript.sql   # show execution trace
+./build/bin/dabble myscript.dabble
+./build/bin/dabble --verbose myscript.dabble      # show execution trace
+./build/bin/dabble --progress myscript.dabble     # show progress bar
+./build/bin/dabble myscript.dabble month=2026-04  # pass parameters
 ```
+
+Scripts use the `.dabble` extension. A VS Code syntax highlighting extension is included in `vscode-dabble/` — copy it to `~/.vscode/extensions/` and restart.
 
 ---
 
 ## Language Reference
 
-Dabble scripts are plain `.sql` files — VS Code syntax highlighting works out of the box. Comments are `--`.
+Comments are `--`. Indentation is 4 spaces. Scripts are plain text files.
+
+---
 
 ### Tables — `let` / `table`
 
 Materialises a query into a DuckDB temp table. Lives for the duration of the script.
 
 ```sql
--- Table functions work directly without SELECT * FROM:
-let data   = read_csv('mydata.csv')
-let events = read_parquet('s3://bucket/events/*.parquet')
+-- Table functions work directly — no SELECT * FROM needed:
+let data    = read_csv('mydata.csv')
+let events  = read_parquet('s3://bucket/events/*.parquet')
+let records = read_json('records.json')
 
--- Full queries still work as before:
-let paid  = SELECT * FROM orders WHERE status = 'paid'
+-- Full queries:
+let paid = orders WHERE status = 'paid'
+
 let report =
     SELECT o.*, p.name, p.category
     FROM orders o
@@ -156,73 +73,97 @@ let report =
     ORDER BY o.id
 ```
 
-`let` and `table` are aliases. Use whichever reads better.
+`let` and `table` are aliases. Multi-line queries use indentation — no semicolon needed inside `let` bodies.
+
+Bare table name on its own line prints the full table:
+```sql
+let summary = my_fn()
+summary          -- shorthand for SELECT * FROM summary
+```
 
 ---
 
 ### Scalars — `val` / `scalar`
 
-Stores a single typed value. Under the hood it lives in a DuckDB temp table so the original type (`DATE`, `DECIMAL`, `INTERVAL`, etc.) is preserved — no string casting, no quoting surprises.
+Stores a single typed value via DuckDB `SET VARIABLE`. The original type (`DATE`, `DECIMAL`, `INTERVAL`, `VARCHAR[]`, etc.) is fully preserved — no string casting, no quoting surprises.
 
 ```sql
 val threshold  = 500
 val cutoff     = CURRENT_DATE - INTERVAL 30 DAYS
-scalar label   = 'monthly report'
-val total      = SELECT SUM(price * qty) FROM paid
+val label      = STRFTIME(CURRENT_DATE, '%Y-%m')
+scalar greeting = 'hello'
+val total       = SELECT SUM(price * qty) FROM paid
+val top_region  = SELECT region FROM sales ORDER BY revenue DESC LIMIT 1
 ```
 
 `val` and `scalar` are aliases. Only write `SELECT` when you need a `FROM` clause.
 
-Scalars substitute as properly-typed subquery fragments, so comparisons, date math, and arithmetic all work exactly as they would in native SQL:
+**Two substitution modes:**
 
 ```sql
-val cutoff = CURRENT_DATE - INTERVAL 30 DAYS
-val avg    = SELECT AVG(amount) FROM orders
+val status   = 'paid'
+val fragment = 'LEFT JOIN products p ON p.id = o.product_id'
 
-SELECT * FROM orders WHERE created_at > cutoff AND amount > avg
+-- Bare name: typed runtime value via getvariable() — type-safe
+SELECT * FROM orders WHERE status = status
+
+-- {{name}}: raw string injection — for dynamic SQL construction
+SELECT o.customer, SUM(o.qty * p.price)
+FROM orders o
+{{fragment}}
+WHERE o.status = '{{status}}'
+GROUP BY o.customer
 ```
 
-Reference with `{{name}}` (explicit) or bare `name` surrounded by spaces or punctuation (implicit).
+**FROM inference** — when a column exists in exactly one known `let` table, `FROM` can be omitted:
+
+```sql
+let paid = SELECT * FROM orders WHERE status = 'paid'
+
+val total = SUM(amount)       -- 'amount' found uniquely in 'paid' → inferred
+if (SUM(amount) > 1000):      -- same inference
+if (total > 1000):            -- total is a scalar, no FROM needed at all
+```
 
 ---
 
 ### Functions — `fn`
 
-Functions build a self-contained CTE chain and return the last `SELECT`. They never touch the database until called — everything is lazy.
+Functions build a self-contained CTE chain and return the last `SELECT`. They never touch the database until called. Parameters are bound as typed scalars.
 
 ```sql
-fn paid_summary():
-    let enriched = SELECT o.*, p.category, p.price
+fn orders_by_status(status, min_qty):
+    let filtered = SELECT o.*, p.name AS product_name, p.price
         FROM orders o JOIN products p ON p.id = o.product_id
-        WHERE o.status = 'paid'
-    SELECT
-        category,
-        COUNT(*)         AS orders,
-        SUM(qty * price) AS revenue
-    FROM enriched
-    GROUP BY category
-    ORDER BY revenue DESC
+        WHERE o.status = status AND o.qty >= min_qty
+    SELECT product_name, qty, ROUND(qty * price, 2) AS total
+    FROM filtered
+    ORDER BY total DESC
 
--- Materialise into a temp table:
-let summary = paid_summary()
+-- Materialise with args:
+let big_paid = orders_by_status('paid', 5)
 
--- Or run and print directly:
-paid_summary()
+-- Call directly and print:
+orders_by_status('refunded', 1)
+
+-- Args can be expressions or outer-scope scalars:
+val min = 3
+let medium = orders_by_status('paid', min)
 ```
 
-`let` inside a function becomes a CTE — not a real temp table — so the whole function compiles down to a single `WITH` chain that DuckDB optimises as one query. `val` inside a function is scoped and dropped on return.
+`let` inside a function becomes a CTE — compiled to a single `WITH` chain. `val` inside a function is scoped and dropped on return.
 
 ---
 
-
 ### Projections — `projection` / `proj` / `cols` / `columns`
 
-A named, reusable column list. Spread anywhere in a SELECT with `...name`.
+Named, reusable column lists. Spread anywhere in a `SELECT` with `...name`.
 
 ```sql
 projection deal_core =
     deal_id,
     rep_name,
+    region,
     ROUND(amount, 2) AS amount,
     close_date
 
@@ -231,44 +172,51 @@ proj metrics =
     deal_tier,
     is_won
 
+cols rep_stats =
+    rep_name,
+    team,
+    COUNT(*) FILTER (WHERE is_won = 1)               AS won_deals,
+    ROUND(SUM(amount) FILTER (WHERE is_won = 1), 0)  AS won_revenue,
+    ROUND(AVG(is_won) * 100, 1)                      AS win_rate
+
 -- Spread into any query:
-let report = SELECT ...deal_core, region FROM enriched ORDER BY close_date
+let report  = SELECT ...deal_core, region FROM enriched ORDER BY close_date
+let full    = SELECT ...deal_core, ...metrics FROM enriched
+let exports = SELECT ...deal_core, product_category FROM enriched WHERE is_won = 1
 
--- Combine multiple projections:
-let full = SELECT ...deal_core, ...metrics FROM enriched
-
--- Mix with other columns:
-let export = SELECT ...deal_core, product_category, team
-    FROM enriched WHERE is_won = 1
+-- In a function:
+fn leaderboard():
+    SELECT ...rep_stats, ROUND(AVG(margin_pct), 1) AS avg_margin
+    FROM enriched GROUP BY rep_name, team ORDER BY won_revenue DESC
 ```
 
-All four keywords are aliases — use whichever reads best in context.
-Projection column lists can reference `{{vars}}` which are resolved at definition time.
+All four keywords are aliases. Projection column lists can contain `{{vars}}` resolved at definition time.
 
 ---
 
 ### For loops — `for`
 
-Iterates over every row of a table or inline query.
+Iterates over every row of a table, inline query, or column shorthand.
 
 ```sql
+-- Standard loop:
 for c in customers:
-    print '{{c.name}} — ${{c.total_spent}}'
+    print '{{c.name}} spent ${{c.total}}'
 
 -- table.column shorthand — single-column, var IS the value:
 for name in customers.name:
-    print name
+    print name || ' (' || UPPER(name) || ')'
 
--- Inline query:
-for row in (SELECT category, SUM(revenue) AS rev FROM summary GROUP BY category):
-    print '{{row.category}}: $' || ROUND(row.rev, 2)
+-- Inline query as source:
+for row in (SELECT region, SUM(revenue) AS rev FROM summary GROUP BY region):
+    print '{{row.region}}: $' || ROUND(row.rev, 2)
 ```
 
 ---
 
 ### If / Else — `if`
 
-Any SQL expression or query, evaluated by DuckDB. `SELECT` is optional when a `FROM` clause is present.
+Any SQL expression, evaluated by DuckDB. `SELECT` is always optional.
 
 ```sql
 if (total > 1000):
@@ -278,66 +226,153 @@ else if (total > 500):
 else:
     print 'rough month'
 
--- These are equivalent:
 if (COUNT(*) > 0 FROM orders WHERE status = 'pending'):
-if (SELECT COUNT(*) > 0 FROM orders WHERE status = 'pending'):
-
--- FROM can be omitted if the column exists in exactly one known let-table:
-let paid = SELECT * FROM orders WHERE status = 'paid'
-val total = SUM(amount)   -- Dabble finds 'amount' uniquely in 'paid'
-if (total > 1000):        -- total is a scalar, no FROM needed
-if (COUNT(*) > 5):        -- COUNT needs no column, won't auto-infer FROM
-if (SUM(amount) > 1000):  -- 'amount' found in 'paid' → FROM paid inferred
+    print 'pending orders exist'
 ```
 
 ---
 
 ### While — `while`
 
-Condition follows the same rules as `if`. Scalars can drive the loop:
+```sql
+CREATE TEMP TABLE counter (n INTEGER);
+INSERT INTO counter VALUES (10);
+
+while (SELECT n > 0 FROM counter):
+    print SELECT 'tick: ' || n FROM counter
+    UPDATE counter SET n = n - 1;
+```
+
+Scalars can drive the loop — reassigning `val offset = offset + batch_size` updates the variable each iteration.
+
+---
+
+### Expect / Check — `expect` / `check`
+
+Data quality assertions. `fail` exits with a red error. `warn` prints yellow and continues. `check` and `expect` are aliases.
 
 ```sql
-val batch_size = 1000
-val offset     = 0
-
-while (offset < (SELECT COUNT(*) FROM events)):
-    SELECT * FROM events LIMIT batch_size OFFSET offset > batch_{{offset}}.csv
-    val offset = offset + batch_size
+check  (COUNT(*) > 0 FROM paid)                   else fail 'no paid orders'
+expect (COUNT(*) = 0 FROM dupes)                  else fail 'duplicates found'
+check  (SUM(amount) > 0 FROM ledger)              else warn 'ledger is zero'
+expect (MAX(created_at) > CURRENT_DATE - INTERVAL 1 DAY FROM events)
+    else warn 'no events in last 24 hours'
 ```
 
 ---
 
-### Expect — `expect`
-
-Data quality assertions. `fail` exits immediately with a red error. `warn` prints a yellow warning and continues.
+### Print — `print`
 
 ```sql
--- check and expect are aliases:
-check  (COUNT(*) > 0 FROM paid)              else fail 'no paid orders found'
-expect (COUNT(*) > 0 FROM paid)              else fail 'no paid orders found'
-expect (COUNT(*) = 0 FROM dupes)             else fail 'duplicate order IDs detected'
-expect (SUM(amount) > 0 FROM ledger)         else warn 'ledger total is zero'
-expect (MAX(created_at) > CURRENT_DATE - INTERVAL 1 DAY FROM events)
-    else warn 'no events in the last 24 hours'
+print 'hello world'
+print total                             -- scalar variable
+print 'revenue: ${{total}}'            -- string interpolation
+print 'revenue: $' || total            -- expression
+print SELECT * FROM summary            -- full result set (multi-row)
+print SELECT COUNT(*) FROM orders      -- single value
+print SELECT                           -- multi-line
+    'orders: ' || COUNT(*) ||
+    ' revenue: $' || SUM(amount)
+FROM paid
+```
+
+---
+
+### Export — `->` and `>>`
+
+```sql
+SELECT * FROM summary ORDER BY revenue DESC -> report.csv
+SELECT * FROM errors >> error_log.csv          -- append mode
+
+-- Dynamic filename from scalar:
+val label = STRFTIME(CURRENT_DATE, '%Y-%m')
+SELECT * FROM summary -> reports/summary_{{label}}.csv
+
+-- Named table shorthand:
+leaderboard -> reports/leaderboard.csv
+```
+
+---
+
+### CLI arguments & environment variables
+
+Pass `key=value` pairs after the script path — available inside scripts as `env.key`:
+
+```bash
+dabble pipeline.dabble month=2026-04 region=EMEA min_deal=1000
+```
+
+```sql
+val month  = COALESCE(TRY_CAST(env.month AS DATE), CURRENT_DATE)
+val region = env.region          -- empty string if not passed
+val limit  = COALESCE(TRY_CAST(env.min_deal AS INTEGER), 500)
+
+let deals = SELECT * FROM orders
+    WHERE close_date >= month
+    AND (region = '' OR UPPER(area) = UPPER(region))
+    AND amount >= limit
+```
+
+System environment variables work the same way: `env.HOME`, `env.MY_SECRET`, etc.
+
+---
+
+### Import — `import`
+
+Runs another Dabble file in the current context. Paths resolve relative to the importing file, so imports work regardless of working directory.
+
+```sql
+import "lib/projections.dabble"
+import "config.dabble"
+```
+
+---
+
+### Progress — `--progress`
+
+```bash
+# Human-readable animated bar on stderr:
+./dabble --progress pipeline.dabble
+
+# Machine-readable structured lines — for calling from another program:
+./dabble --progress pipeline.dabble 2>progress.log
+```
+
+Machine mode (when stderr is not a tty) emits:
+```
+PROGRESS 1/24 let raw_deals
+PROGRESS 2/24 let products
+PROGRESS 3/24 for row (245/10000)
+PROGRESS DONE
+```
+
+Easy to parse from any language:
+```python
+proc = subprocess.Popen(['dabble', '--progress', 'pipeline.dabble'],
+                        stderr=subprocess.PIPE)
+for line in proc.stderr:
+    if line.startswith(b'PROGRESS'):
+        parts = line.split()
+        cur, tot = map(int, parts[1].split(b'/'))
+        update_progress_bar(cur / tot)
 ```
 
 ---
 
 ### Statement termination
 
-Multi-line SQL statements at the top level need a semicolon to signal the end. Inside `let`, `val`, or `fn` bodies, indentation handles this automatically — no semicolons needed.
+Multi-line raw SQL at the top level needs a semicolon. Inside `let`, `val`, and `fn` bodies, indentation handles termination automatically.
 
 ```sql
--- Top level: semicolon required when followed by another raw statement
+-- Top level: semicolon needed when one raw statement follows another
 INSERT INTO log VALUES (now(), 'ran');
 SELECT * FROM log;
 
--- Single statement followed by a Dabble keyword: semicolon optional
+-- Single raw statement followed by a Dabble keyword: semicolon optional
 SELECT * FROM summary
+let next = SELECT 1    -- Dabble keyword terminates the SELECT above
 
-let next = SELECT 1   -- Dabble keyword terminates the SELECT above
-
--- let/fn bodies: indentation terminates, no semicolons needed
+-- Inside let/fn bodies: indentation terminates, no semicolons needed
 let report =
     SELECT o.*, p.name
     FROM orders o
@@ -347,81 +382,24 @@ let report =
 
 ---
 
-### Bare table name
+### Persistent databases
 
-A plain identifier on its own line prints the full table — shorthand for `SELECT * FROM name`:
-
-```sql
-let result = orders_by_status('paid', 3)
-result       -- prints SELECT * FROM result
-```
-
----
-
-### Print — `print`
-
-Prints a string, evaluates an expression, or renders a full result set. Multi-line works with indentation.
+Dabble runs in-memory by default. To use a persistent DuckDB database, add these two lines at the top of your script — it's plain DuckDB SQL, no special Dabble syntax needed:
 
 ```sql
-print 'hello world'
-print total                              -- scalar
-print 'revenue: $' || total             -- expression with scalar
-print SELECT * FROM summary             -- full result set
-print SELECT
-    'orders: '  || COUNT(*)  ||
-    ' revenue: $' || SUM(amount)
-FROM paid
+ATTACH 'mydata.duckdb' AS mydb;
+USE mydb;
+
+-- all lets, fns, vals now operate against mydata.duckdb
+let users = SELECT * FROM users WHERE active = true
+val total = SELECT COUNT(*) FROM orders
+
+-- query across multiple attached databases:
+ATTACH 'archive.duckdb' AS archive;
+let combined = SELECT * FROM orders UNION ALL SELECT * FROM archive.orders
 ```
 
----
-
-### Export — `>` and `>>`
-
-Redirect any query to a CSV file.
-
-```sql
-SELECT * FROM summary ORDER BY revenue DESC -> report.csv
-SELECT * FROM errors >> error_log.csv        -- append
-```
-
----
-
-
-### CLI arguments & environment variables
-
-Pass `key=value` pairs after the script path — they become environment variables accessible via `env.key`:
-
-```bash
-dabble pipeline.dabble month=2026-04 region=EMEA min_deal=1000
-dabble report.dabble env=prod
-```
-
-Inside the script:
-
-```sql
--- Read CLI arg, fall back to default with COALESCE
-val month      = COALESCE(TRY_CAST(env.month AS DATE), CURRENT_DATE)
-val region     = env.region          -- empty string if not passed
-val min_amount = COALESCE(TRY_CAST(env.min_deal AS INTEGER), 500)
-
--- Use directly in queries:
-let deals = SELECT * FROM orders
-    WHERE close_date >= month
-    AND (region = '' OR UPPER(area) = UPPER(region))
-```
-
-System environment variables work the same way — `env.HOME`, `env.PATH`, `env.MY_SECRET` etc. CLI args take precedence over existing env vars since `setenv` is called with overwrite=1.
-
----
-
-### Import — `import`
-
-Runs another `.sql` file in the current context. Paths resolve relative to the importing file.
-
-```sql
-import "lib/helpers.sql"
-import "setup.sql"
-```
+Since Dabble passes raw SQL straight through to DuckDB, any DuckDB feature works at the top of a script: `ATTACH`, `INSTALL`, `LOAD`, `SET`, `CREATE SECRET`, etc.
 
 ---
 
@@ -430,38 +408,69 @@ import "setup.sql"
 Dabble compiles your script to an AST, then walks it. Each statement is either:
 
 - **Handed directly to DuckDB** — raw SQL, `let`, `val`, redirects
-- **Used to drive iteration** — `for` fetches rows and loops, `while` re-evaluates a condition each pass
-- **Built into a CTE chain** — `let` and `val` inside `fn` bodies are lazy, never hitting the database until the caller materialises them
+- **Used to drive iteration** — `for` fetches rows and loops, `while` re-evaluates each pass
+- **Built into a CTE chain** — `let` and `val` inside `fn` bodies are lazy, compiled to a single `WITH` chain DuckDB optimises as one query
 
 There is no expression evaluator, no type system, no query planner. DuckDB handles all of that. Dabble's entire job is sequencing.
 
-The result: cold start overhead is minimal — almost everything becomes a single DuckDB query.
+---
+
+
+### Dependency analysis — `--deps`
+
+Analyze the dependency graph of a script without executing it. Useful for understanding data lineage, planning changes, and answering "if I change X, what breaks?"
+
+```bash
+# Full graph — all nodes and their dependencies
+dabble --deps pipeline.dabble
+
+# What does changing this projection affect? (downstream)
+dabble --deps --changed=projection:deal_core pipeline.dabble
+
+# What does let:summary depend on? (upstream)
+dabble --deps --upstream=let:summary pipeline.dabble
+
+# Where did the data in this table originally come from?
+dabble --deps --sources=let:enriched pipeline.dabble
+
+# Which CSV exports does this flow into?
+dabble --deps --destinations=let:paid pipeline.dabble
+
+# Export as Graphviz DOT — pipe to dot for an SVG diagram
+dabble --deps --format=dot pipeline.dabble | dot -Tsvg > graph.svg
+
+# Export as JSON — store lineage, query with DuckDB
+dabble --deps --format=json pipeline.dabble > lineage.json
+duckdb -c "SELECT name, kind FROM read_json('lineage.json').nodes WHERE kind = 'export'"
+```
+
+The dependency graph tracks: `let` tables, `val` scalars, `fn` functions, `projection` column sets, external data sources (`read_csv`, `read_parquet`, etc.), raw SQL mutations (`UPDATE`, `INSERT`, `DELETE`), and file exports (`->`).
+
+Dependency analysis never executes the script — it only parses. Cold start is practically instant.
 
 ---
 
 ## What Dabble actually sends to DuckDB
 
-Dabble is transparent by design. Here is a realistic script and the exact SQL it generates.
-
-**Dabble script:**
+Dabble is transparent by design. Here is a script and the SQL it generates:
 
 ```sql
-val cutoff  = CURRENT_DATE - INTERVAL 30 DAYS
-val avg     = SELECT AVG(amount) FROM orders WHERE status = 'paid'
+val cutoff = CURRENT_DATE - INTERVAL 30 DAYS
+val avg    = SELECT AVG(amount) FROM orders WHERE status = 'paid'
 
 fn recent_summary():
-    let paid    = SELECT * FROM orders WHERE status = 'paid' AND created_at > cutoff
-    let ranked  = SELECT customer_id, SUM(amount) AS total FROM paid GROUP BY customer_id
+    let paid   = SELECT * FROM orders WHERE status = 'paid' AND created_at > cutoff
+    let ranked = SELECT customer_id, SUM(amount) AS total FROM paid GROUP BY customer_id
     SELECT * FROM ranked WHERE total > avg ORDER BY total DESC
 
 let summary = recent_summary()
-expect (COUNT(*) > 0 FROM summary) else fail 'no customers above average'
+check (COUNT(*) > 0 FROM summary) else fail 'no customers above average'
 
 for row in summary:
-    print row.customer_id || ' — $' || ROUND(row.total, 2)
+    print '{{row.customer_id}} — $' || ROUND(row.total, 2)
 ```
 
-**What DuckDB actually receives, statement by statement:**
+**What DuckDB receives:**
 
 ```sql
 -- val cutoff
@@ -471,9 +480,7 @@ SET VARIABLE __val_0_cutoff = (SELECT (CURRENT_DATE - INTERVAL 30 DAYS));
 SET VARIABLE __val_0_avg = (SELECT AVG(amount) FROM orders WHERE status = 'paid');
 
 -- let summary = recent_summary()
--- The function never ran a query. Its lets became CTEs.
--- Scalars inject as getvariable() — a plain scalar function call.
--- The whole function compiles down to a single WITH chain:
+-- Function body produced zero queries. lets became CTEs, scalars inject as getvariable().
 CREATE OR REPLACE TEMP TABLE summary AS (
     WITH paid AS (
         SELECT * FROM orders
@@ -482,50 +489,43 @@ CREATE OR REPLACE TEMP TABLE summary AS (
     ),
     ranked AS (
         SELECT customer_id, SUM(amount) AS total
-        FROM paid
-        GROUP BY customer_id
+        FROM paid GROUP BY customer_id
     )
     SELECT * FROM ranked
     WHERE total > getvariable('__val_0_avg')
     ORDER BY total DESC
 );
 
--- expect
-SELECT 1 FROM (
-    SELECT (COUNT(*)) AS _cond FROM summary
-) WHERE _cond IS TRUE LIMIT 1;
+-- check
+SELECT 1 FROM (SELECT (COUNT(*)) AS _cond FROM summary) WHERE _cond IS TRUE LIMIT 1;
 
--- for row in summary: print row.customer_id || ' — $' || ROUND(row.total, 2)
--- (one query per row, column values substituted as literals)
+-- for row in summary: print ...
 SELECT ('alice' || ' — $' || ROUND(312.50, 2));
 SELECT ('bob'   || ' — $' || ROUND(274.00, 2));
--- ...
 ```
 
-A few things worth noticing:
+Key things to notice:
+- The function compiled to **one query**, regardless of how many `let` statements were inside it
+- Scalars inject as `getvariable()` — typed, not strings — so date math, comparisons, and arithmetic all work correctly
+- Dabble itself evaluates nothing. Every number, date, and comparison goes through DuckDB
 
-- The function body produced **zero queries during definition**. It only ran when `let summary = recent_summary()` was reached, and even then as a single `WITH` statement.
-- Scalars inject as `getvariable('__val_0_cutoff')` — a plain scalar function call, not a subquery. This means scalars work anywhere in DuckDB: table macro parameters, extension function arguments, `COPY` options, anywhere a subquery would be rejected.
-- The `expect` condition `COUNT(*) > 0 FROM summary` was normalised to a full `SELECT` and wrapped in a subquery. DuckDB evaluates it; Dabble just checks whether any row came back.
-- Dabble itself never evaluates a single expression. Every number, date, string, and comparison is computed by DuckDB.
-
+---
 
 ## What Dabble intentionally is not
 
-- **Not a general scripting language.** No file I/O beyond CSV, no HTTP, no string manipulation outside SQL.
-- **Not a Python replacement.** If you need pandas, numpy, or ML — use Python. Dabble is for the part of your pipeline that is already pure SQL logic.
-- **Not production-ready.** Error messages are improving. The language will change. Things will break.
+- **Not a general scripting language.** No file I/O beyond CSV/parquet, no HTTP, no string manipulation outside SQL.
+- **Not a Python replacement.** If you need pandas, ML, or complex application logic — use Python. Dabble is for the part of your pipeline that is already pure SQL logic.
+- **Not production-ready.** The language is still evolving. Things will change.
 - **Not an ORM.** Dabble doesn't know what a model is.
 
 ---
 
 ## Roadmap / known gaps
 
-- [ ] Function parameters
-- [ ] Better indentation handling (currently hardcoded 4 spaces)
-- [ ] `return` keyword for early exit from functions
-- [ ] Persistent database support (currently in-memory only)
+- [ ] Better indentation handling (currently hardcoded 4 spaces — tabs unsupported)
+- [ ] `return` for early exit from functions
 - [ ] Package/module system beyond `import`
+- [ ] Function return type inference (scalar vs table)
 
 ---
 

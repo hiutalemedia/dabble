@@ -86,7 +86,7 @@ std::string Parser::collectSQL(int minIndent, std::string& redirect_file, bool& 
         }
 
         // Redirect operator ends the statement
-        std::regex redir(R"(^(.*)\s*(>>|->|>)\s*([^\s>]+)\s*$)");
+        std::regex redir(R"(^(.*?)\s*(->|>>|>)\s*([^\s>]+)\s*$)");
         std::smatch match;
         if (std::regex_match(t, match, redir)) {
             // Strip trailing semicolon from the SQL part if present

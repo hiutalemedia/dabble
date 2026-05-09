@@ -43,26 +43,24 @@ std::string replaceAll(std::string s,
             pos += v.size();
         }
     }
-    // Also handle {{name}} for loop variables (row.col) from env
-    for (const auto& [k, v] : env) {
-        std::string placeholder = "{{" + k + "}}";
-        size_t pos = 0;
-        while ((pos = s.find(placeholder, pos)) != std::string::npos) {
-            // Don't double-substitute if raw already handled it
-            s.replace(pos, placeholder.size(), v);
-            pos += v.size();
-        }
-    }
-
     // bare name — typed value reference, injects getvariable() fragment.
     // Only from env (loop vars and for-loop columns).
+    // Skips any match that falls inside a {{...}} template marker so bare
+    // substitution never clobbers unresolved template expressions.
     for (const auto& [k, v] : env) {
         size_t pos = 0;
         while ((pos = s.find(k, pos)) != std::string::npos) {
-            bool left_ok = (pos == 0) || (!std::isalnum(s[pos - 1]) && s[pos - 1] != '.');
-            bool right_ok = (pos + k.size() == s.size()) || !std::isalnum(s[pos + k.size()]);
+            bool left_ok = (pos == 0) || (!std::isalnum(s[pos - 1]) && s[pos - 1] != '.' && s[pos - 1] != '_');
+            bool right_ok = (pos + k.size() == s.size()) || (!std::isalnum(s[pos + k.size()]) && s[pos + k.size()] != '.');
 
-            if (left_ok && right_ok) {
+            // Skip if match is inside a {{...}} template — raw loop handles those
+            bool in_template = false;
+            if (pos >= 2 && s[pos - 1] == '{' && s[pos - 2] == '{') {
+                size_t close = s.find("}}", pos + k.size());
+                if (close != std::string::npos) in_template = true;
+            }
+
+            if (left_ok && right_ok && !in_template) {
                 s.replace(pos, k.size(), v);
                 pos += v.size();
             } else {

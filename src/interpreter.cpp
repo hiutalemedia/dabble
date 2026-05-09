@@ -437,7 +437,7 @@ FnResult Interpreter::execFn(const FnStmt& fn, Env env,
         if (trimmed.rfind("getvariable(", 0) == 0) {
             expr = trimmed;  // already resolved, pass through as-is
         } else {
-            expr = resolve(raw_arg, env);  // substitute outer-scope vars
+            expr = resolve(raw_arg, env, raw);  // substitute outer-scope vars
         }
 
         std::string upper = expr;
@@ -470,7 +470,7 @@ FnResult Interpreter::execFn(const FnStmt& fn, Env env,
         current_line = n->line_no;
 
         if (auto* let = std::get_if<LetStmt>(&n->node)) {
-            std::string sql = trim(resolve(let->sql, env));
+            std::string sql = trim(resolve(let->sql, env, raw));
 
             std::string inner_fn; std::vector<std::string> inner_args;
             if (isFunctionCall(sql, inner_fn, inner_args) && functions.count(inner_fn)) {
@@ -488,7 +488,7 @@ FnResult Interpreter::execFn(const FnStmt& fn, Env env,
             exec(*val, env, raw);
 
         } else if (auto* stmt = std::get_if<SQLStmt>(&n->node)) {
-            std::string sql = trim(resolve(stmt->sql, env));
+            std::string sql = trim(resolve(stmt->sql, env, raw));
             std::string upper = sql;
             std::transform(upper.begin(), upper.end(), upper.begin(),
                            [](unsigned char c){ return std::toupper(c); });
@@ -517,7 +517,7 @@ FnResult Interpreter::execFn(const FnStmt& fn, Env env,
 // ====================== LET ======================
 
 void Interpreter::exec(const LetStmt& s, Env& env, RawEnv& raw) {
-    std::string sql = trim(resolve(s.sql, env));
+    std::string sql = trim(resolve(s.sql, env, raw));
 
     std::string fn_name; std::vector<std::string> fn_args;
     if (isFunctionCall(sql, fn_name, fn_args) && functions.count(fn_name)) {
@@ -571,7 +571,7 @@ void Interpreter::exec(const LetStmt& s, Env& env, RawEnv& raw) {
 // Subsequent statements in the same block see it via {{name}} or bare name.
 
 void Interpreter::exec(const ValStmt& s, Env& env, RawEnv& raw) {
-    std::string expr = trim(resolve(s.expr, env));
+    std::string expr = trim(resolve(s.expr, env, raw));
 
     // Use DuckDB SET VARIABLE so the value is stored with its original type
     // (DATE, DECIMAL, INTERVAL, etc.) and can be referenced anywhere via
@@ -605,6 +605,23 @@ void Interpreter::exec(const ValStmt& s, Env& env, RawEnv& raw) {
     // Scope-prefix the variable name so function-local vals never collide
     // with same-named vals at outer scopes.
     std::string varname = "__val_" + std::to_string(fn_depth) + "_" + s.name;
+
+    // Fetch raw string value by executing the expression directly — before SET VARIABLE
+    // so raw[s.name] is always set even if SET VARIABLE fails.
+    // Execute value_expr directly for reliability; avoids SET VARIABLE → getvariable round-trip.
+    {
+        duckdb_result raw_res;
+        std::string raw_err = dbExec("SELECT CAST(" + value_expr + " AS VARCHAR)", &raw_res);
+        if (raw_err.empty() && duckdb_row_count(&raw_res) > 0) {
+            char* v = duckdb_value_varchar(&raw_res, 0, 0);
+            raw[s.name] = v ? v : "";
+            if (v) duckdb_free(v);
+        } else {
+            raw[s.name] = "";
+        }
+        duckdb_destroy_result(&raw_res);
+    }
+
     std::string set_sql = "SET VARIABLE " + varname + " = " + value_expr;
     std::string err = dbExec(set_sql);
     if (!err.empty()) {
@@ -615,22 +632,10 @@ void Interpreter::exec(const ValStmt& s, Env& env, RawEnv& raw) {
     // Register so scope exit can NULL it out (DuckDB has no DROP VARIABLE).
     val_scopes.back().push_back(varname);
 
-    // Inject as getvariable() — a plain scalar function call that works
-    // everywhere, including as a macro/extension parameter.
+    // Inject as getvariable() — typed runtime reference for SQL expressions.
     env[s.name] = "getvariable('" + varname + "')";
 
-    // Fetch the actual string value for {{name}} raw injection.
-    // CAST to VARCHAR handles all types including arrays and structs.
-    {
-        duckdb_result res;
-        dbExec("SELECT CAST(getvariable('" + varname + "') AS VARCHAR)", &res);
-        char* v = duckdb_value_varchar(&res, 0, 0);
-        std::string raw_val = v ? v : "";
-        if (v) duckdb_free(v);
-        duckdb_destroy_result(&res);
-        raw[s.name] = raw_val;
-        if (verbose) std::cout << dim("✓ val " + s.name + " = " + raw_val) << "\n";
-    }
+    if (verbose) std::cout << dim("✓ val " + s.name + " = " + raw[s.name]) << "\n";
 }
 
 // ====================== FOR =======================
@@ -722,7 +727,7 @@ void Interpreter::exec(const ExpectStmt& s, Env& env, RawEnv& raw) {
 // ====================== PRINT ======================
 
 void Interpreter::exec(const PrintStmt& s, Env& env, RawEnv& raw) {
-    std::string text = trim(resolve(s.text, env));
+    std::string text = trim(resolve(s.text, env, raw));
 
     std::string upper = text;
     std::transform(upper.begin(), upper.end(), upper.begin(),
@@ -802,7 +807,7 @@ void Interpreter::exec(const ImportStmt& s, Env& env, RawEnv& raw) {
 // ====================== SQL ======================
 
 void Interpreter::exec(const SQLStmt& s, Env& env, RawEnv& raw) {
-    std::string sql = trim(resolve(s.sql, env));
+    std::string sql = trim(resolve(s.sql, env, raw));
     if (sql.empty()) return;
 
     // Bare table name shorthand: a single plain identifier (letters, digits, _)
