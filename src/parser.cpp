@@ -72,12 +72,26 @@ std::vector<ASTPtr> Parser::parseBlock(int baseIndent) {
         else if (t.rfind("check ", 0) == 0)  block.push_back(parseExpect(baseIndent));
         else if (t.rfind("fn ", 0) == 0)     block.push_back(parseFn(baseIndent));
         else if (t.rfind("print ", 0) == 0)  block.push_back(parsePrint());
+        else if (t.rfind("log ", 0) == 0)    block.push_back(parseLog());
         else if (t.rfind("import ", 0) == 0)     block.push_back(parseImport());
         else if (t.rfind("projection ", 0) == 0) block.push_back(parseProjection(baseIndent));
         else if (t.rfind("proj ", 0) == 0)       block.push_back(parseProjection(baseIndent));
         else if (t.rfind("columns ", 0) == 0)    block.push_back(parseProjection(baseIndent));
         else if (t.rfind("cols ", 0) == 0)       block.push_back(parseProjection(baseIndent));
-        else                                 block.push_back(parseRawSQL(baseIndent));
+        else {
+            // Detect array let append: "name += expr"
+            // Must check before parseRawSQL so += is not mistaken for SQL.
+            auto plus_eq = t.find("+=");
+            bool is_arr_append = false;
+            if (plus_eq != std::string::npos && plus_eq > 0) {
+                std::string lhs = trim(t.substr(0, plus_eq));
+                is_arr_append = !lhs.empty();
+                for (char c : lhs)
+                    if (!std::isalnum((unsigned char)c) && c != '_') { is_arr_append = false; break; }
+            }
+            if (is_arr_append) block.push_back(parseArrAppend(baseIndent));
+            else               block.push_back(parseRawSQL(baseIndent));
+        }
     }
     return block;
 }
@@ -102,7 +116,7 @@ std::string Parser::collectSQL(int minIndent, std::string& redirect_file, bool& 
             t.rfind("for ", 0) == 0 || t.rfind("if ", 0) == 0 ||
             t.rfind("while ", 0) == 0 || t.rfind("expect ", 0) == 0 ||
             t.rfind("check ", 0) == 0 || t.rfind("fn ", 0) == 0 ||
-            t.rfind("print ", 0) == 0 || t.rfind("import ", 0) == 0 ||
+            t.rfind("print ", 0) == 0 || t.rfind("log ", 0) == 0 || t.rfind("import ", 0) == 0 ||
             t.rfind("else", 0) == 0 || t.rfind("projection ", 0) == 0 ||
             t.rfind("proj ", 0) == 0 || t.rfind("columns ", 0) == 0 ||
             t.rfind("cols ", 0) == 0) {
@@ -181,6 +195,32 @@ ASTPtr Parser::parseProjection(int baseIndent) {
     return std::make_shared<ASTNode>(ProjectionStmt{name, trim(cols)}, ln);
 }
 
+ASTPtr Parser::parseArrAppend(int baseIndent) {
+    int ln = pos + 1;
+    std::string line = trim(lines[pos]);
+
+    auto plus_eq = line.find("+=");
+    std::string name = trim(line.substr(0, plus_eq));
+    std::string expr_head = trim(line.substr(plus_eq + 2));
+
+    pos++;
+
+    // Collect multi-line expression
+    std::string redirect; bool app = false;
+    int step = detectIndentStep(baseIndent);
+    std::string more = collectSQL(baseIndent + step, redirect, app);
+    if (!more.empty()) {
+        if (!expr_head.empty()) expr_head += "\n";
+        expr_head += more;
+    }
+    expr_head = trim(expr_head);
+    // Strip trailing semicolon
+    if (!expr_head.empty() && expr_head.back() == ';') expr_head.pop_back();
+
+    return std::make_shared<ASTNode>(ArrLetStmt{name, trim(expr_head)}, ln);
+}
+
+
 ASTPtr Parser::parseRawSQL(int baseIndent) {
     int ln = pos + 1;
     std::string redirect_file;
@@ -196,7 +236,28 @@ ASTPtr Parser::parseLet(int baseIndent) {
     // "let name = ..." prefix is 4 chars; "table name = ..." prefix is 6 chars
     int prefix = (line.rfind("table ", 0) == 0) ? 6 : 4;
     std::string name = trim(line.substr(prefix, eq - prefix));
-    std::string sql = trim(line.substr(eq + 1));
+    std::string sql  = trim(line.substr(eq + 1));
+
+    // Detect array let declaration: "let name[] = []" or "let name[] = [a, b, c]"
+    // Strip trailing [] from name to get the base name.
+    bool is_array = (name.size() >= 2 &&
+                     name[name.size()-2] == '[' &&
+                     name[name.size()-1] == ']');
+    if (is_array) {
+        name = trim(name.substr(0, name.size() - 2));
+        // Parse the RHS list: [] = empty init, [a, b, c] = init with items
+        // Strip trailing semicolon
+        if (!sql.empty() && sql.back() == ';') sql.pop_back();
+        // Strip outer brackets
+        std::string inner = trim(sql);
+        if (!inner.empty() && inner.front() == '[' && inner.back() == ']')
+            inner = trim(inner.substr(1, inner.size() - 2));
+        // Each comma-separated item becomes an ArrLetStmt append
+        // We emit one ArrLetStmt with name and the full item list (comma-separated)
+        // The interpreter handles splitting and creating individual tables.
+        pos++;
+        return std::make_shared<ASTNode>(ArrLetStmt{name, inner}, ln);
+    }
 
     pos++;
     std::string redirect; bool app = false;
@@ -216,9 +277,12 @@ ASTPtr Parser::parseVal(int baseIndent) {
     int prefix = (line.rfind("scalar ", 0) == 0) ? 7 : 4;
     std::string name = trim(line.substr(prefix, eq - prefix));
     std::string expr = trim(line.substr(eq + 1));
+    // Strip trailing semicolon from single-line expression
+    if (!expr.empty() && expr.back() == ';') expr.pop_back();
+    expr = trim(expr);
 
     pos++;
-    // Collect multi-line continuation
+    // Collect multi-line continuation (collectSQL strips its own semicolon)
     std::string redirect; bool app = false;
     int val_step = detectIndentStep(baseIndent);
     std::string more = collectSQL(baseIndent + val_step, redirect, app);
@@ -385,6 +449,58 @@ ASTPtr Parser::parsePrint() {
     }
 
     return std::make_shared<ASTNode>(PrintStmt{text}, ln);
+}
+
+
+ASTPtr Parser::parseLog() {
+    // Mirrors parsePrint exactly — same multi-line text collection.
+    // Optional level keyword after "log": debug, info, warn, error.
+    // Examples:
+    //   log 'message'
+    //   log warn 'something looks off'
+    //   log total_revenue
+    //   log COUNT(*) FROM paid
+    int ln = pos + 1;
+    std::string line = lines[pos];
+    int base_indent = indentLevel(line);
+    size_t log_pos = line.find("log ");
+    std::string rest = (log_pos != std::string::npos)
+                     ? trim(line.substr(log_pos + 4)) : "";
+    pos++;
+
+    // Collect continuation lines indented deeper
+    while (pos < (int)lines.size()) {
+        int lvl = indentLevel(lines[pos]);
+        if (lvl <= base_indent) break;
+        std::string t = trim(lines[pos]);
+        if (!t.empty() && t.rfind("--", 0) != 0) rest += " " + t;
+        pos++;
+    }
+
+    rest = trim(rest);
+    if (!rest.empty() && rest.back() == ';') rest.pop_back();
+    rest = trim(rest);
+
+    // Strip inline SQL comments (-- ...) that may follow the expression
+    {
+        size_t cmt = rest.find(" --");
+        if (cmt != std::string::npos) rest = trim(rest.substr(0, cmt));
+    }
+
+    // Extract optional level prefix: "warn message", "error message", etc.
+    // Note: do NOT strip surrounding quotes — evalText handles quoted strings
+    // the same way print does: 'hello' → SELECT ('hello') → "hello"
+    std::string level = "info";
+    static const char* levels[] = {"debug ", "info ", "warn ", "error ", nullptr};
+    for (int i = 0; levels[i]; i++) {
+        if (rest.rfind(levels[i], 0) == 0) {
+            level = trim(std::string(levels[i]));
+            rest  = trim(rest.substr(strlen(levels[i])));
+            break;
+        }
+    }
+
+    return std::make_shared<ASTNode>(LogStmt{rest, level}, ln);
 }
 
 ASTPtr Parser::parseImport() {

@@ -16,6 +16,7 @@ int main(int argc, char** argv) {
     std::string deps_upstream = "";     // node_id for --upstream
     std::string deps_sources = "";      // node_id for --sources
     std::string deps_dests = "";        // node_id for --destinations
+    std::string log_dest;                   // --log=file destination
     const char* file = nullptr;
 
     for (int i = 1; i < argc; i++) {
@@ -56,6 +57,7 @@ int main(int argc, char** argv) {
                   << "Options:\n"
                   << "  --verbose,  -v          show execution trace\n"
                   << "  --progress, -p          show progress bar\n"
+                  << "  --log=<file>            write log to file (.db, .csv, .json)\n"
                   << "  --deps,     -d          analyze dependencies (no execution)\n"
                   << "  --format=text|dot|json      deps output format (default: text)\n"
                   << "  --changed=kind:name         show what changing this affects (downstream)\n"
@@ -107,6 +109,7 @@ int main(int argc, char** argv) {
     check(duckdb_connect(db, &conn), "connect");
 
     Interpreter interp(conn, verbose, progress);
+    if (!log_dest.empty()) interp.setLogDestination(log_dest);
     interp.run(ast, file);
 
     duckdb_disconnect(&conn);

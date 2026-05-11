@@ -15,6 +15,7 @@ private:
     int detectIndentStep(int baseIndent);
     std::string collectSQL(int minIndent, std::string& redirect_file, bool& append);
     ASTPtr parseLet(int baseIndent);    // let / table  → temp table
+    ASTPtr parseArrAppend(int baseIndent); // name += expr → append to array let
     ASTPtr parseVal(int baseIndent);    // val / scalar → env string
     ASTPtr parseFor(int baseIndent);
     ASTPtr parseIf(int baseIndent);
@@ -22,6 +23,7 @@ private:
     ASTPtr parseExpect(int baseIndent);
     ASTPtr parseFn(int baseIndent);
     ASTPtr parsePrint();
+    ASTPtr parseLog();
     ASTPtr parseImport();
     ASTPtr parseProjection(int baseIndent);
     ASTPtr parseRawSQL(int baseIndent);

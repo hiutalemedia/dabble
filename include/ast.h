@@ -36,12 +36,19 @@ struct ExpectStmt { std::string condition; std::string action; std::string messa
 struct FnStmt     { std::string name; std::vector<std::string> params; std::vector<ASTPtr> body; };
 struct SQLStmt    { std::string sql; std::string redirect_file; bool append = false; };
 struct PrintStmt  { std::string text; };
+struct LogStmt    { std::string text; std::string level; };  // like print but writes to __dabble_log + stderr. level: debug/info/warn/error
 struct ImportStmt { std::string filename; };
 struct ProjectionStmt { std::string name, cols; };  // named column list for ...spread
 
+// Array let — a named, ordered collection of temp tables.
+// Each item is stored as __arr_{name}_{index} (1-based).
+// A TEMP VIEW named {name} is kept up-to-date as a UNION BY NAME of all items.
+// Supports: data += expr, data[1], data[-1], data[scalar_val], data (full union via view).
+struct ArrLetStmt { std::string name; std::string expr; };  // += append statement
+
 struct ASTNode {
     std::variant<LetStmt, ValStmt, ForStmt, IfStmt, WhileStmt, ExpectStmt,
-                 FnStmt, SQLStmt, PrintStmt, ImportStmt, ProjectionStmt> node;
+                 FnStmt, SQLStmt, PrintStmt, LogStmt, ImportStmt, ProjectionStmt, ArrLetStmt> node;
     int line_no = 0;
 
     template<typename T>

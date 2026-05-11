@@ -27,7 +27,7 @@ DuckDB is still the engine you drive with. Dabble is just the gearbox that gives
 Requires CMake 3.20+ and a C++20 compiler. DuckDB is downloaded automatically.
 
 ```bash
-git clone https://github.com/hiutalemedia/dabble
+git clone https://github.com/yourname/dabble
 cd dabble
 cmake -B build
 cmake --build build -j
@@ -56,30 +56,65 @@ Comments are `--`. Indentation is 4 spaces. Scripts are plain text files.
 
 Materialises a query into a DuckDB temp table. Lives for the duration of the script.
 
+`SELECT * FROM` is the default — omit it freely:
+
 ```sql
--- Table functions work directly — no SELECT * FROM needed:
-let data    = read_csv('mydata.csv')
-let events  = read_parquet('s3://bucket/events/*.parquet')
-let records = read_json('records.json')
+-- All equivalent:
+let paid = SELECT * FROM orders WHERE status = 'paid';
+let paid = FROM orders WHERE status = 'paid';
+let paid = orders WHERE status = 'paid';
 
--- Full queries:
-let paid = orders WHERE status = 'paid'
+-- Table functions — no SELECT * FROM needed:
+let data    = read_csv('mydata.csv');
+let events  = read_parquet('s3://bucket/events/*.parquet');
 
+-- JOIN shorthand:
 let report =
-    SELECT o.*, p.name, p.category
-    FROM orders o
+    orders o
     JOIN products p ON p.id = o.product_id
     WHERE o.status = 'paid'
-    ORDER BY o.id
+    ORDER BY o.id;
 ```
 
-`let` and `table` are aliases. Multi-line queries use indentation — no semicolon needed inside `let` bodies.
+`let` and `table` are aliases. Every statement ends with `;`.
 
 Bare table name on its own line prints the full table:
+
 ```sql
-let summary = my_fn()
-summary          -- shorthand for SELECT * FROM summary
+let summary = my_fn();
+summary;          -- shorthand for SELECT * FROM summary
 ```
+
+---
+
+### Array lets — `let name[] = []`
+
+A named, ordered collection of tables. Each item is a real temp table; a `TEMP VIEW`
+of the same name is kept as `UNION BY NAME` of all items so you can query it normally.
+
+```sql
+-- Initialise empty, build up in a loop:
+let batches[] = [];
+val urls = ['s3://bucket/jan.parquet', 's3://bucket/feb.parquet'];
+
+for url in (SELECT unnest(urls) AS url):
+    batches += read_parquet(url.url);
+
+-- Query the full union transparently:
+SELECT COUNT(*) FROM batches;
+
+-- Index access — 1-based, negative from end:
+batches[1];          -- first item
+batches[-1];         -- last item
+batches[my_idx];     -- scalar val as index
+
+-- Initialise from existing tables:
+let combined[] = [paid, refunded, pending];
+SELECT COUNT(*) FROM combined;    -- UNION BY NAME of all three
+```
+
+Append operator `+=` creates `__arr_name_N` internally and rebuilds the view.
+Out-of-range index produces a clear error.
 
 ---
 

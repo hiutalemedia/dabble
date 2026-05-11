@@ -294,3 +294,51 @@ print ''
 print '════════════════════════════════════════'
 print SELECT ' All features OK — ' || NOW()
 print '════════════════════════════════════════'
+
+-- ── 13. ARRAY LETS ───────────────────────────────────────────
+
+print ''
+print '── 13. array lets ──'
+
+-- Init empty, build up in a loop
+let batches[] = [];
+
+val cats = ['electronics', 'food', 'stationery'];
+
+for cat in (SELECT unnest(cats) AS cat):
+    batches += paid WHERE category = cat.cat;
+
+-- View gives full union transparently
+print SELECT 'total rows across all batches: ' || COUNT(*) FROM batches
+
+-- Index access: 1-based
+print '--- batch[1] (electronics) ---'
+batches[1];
+
+-- Negative index: last batch
+print '--- batch[-1] (stationery) ---'
+batches[-1];
+
+-- Scalar val as index
+val my_idx = 2;
+print '--- batch[{{my_idx}}] (food) ---'
+batches[my_idx];
+
+-- Init with list of existing lets
+let combined[] = [paid, electronics];
+print SELECT 'combined rows (paid + electronics overlap): ' || COUNT(*) FROM combined
+
+-- ── 14. LOGGING ─────────────────────────────────────────────
+
+print ''
+print '── 14. logging ──'
+
+log 'pipeline section started';
+log warn 'this is a warning';
+log 'total revenue: ' || total_revenue;
+log paid;
+log COUNT(*) FROM orders;
+
+-- Log table is queryable
+print SELECT 'log entries so far: ' || COUNT(*) FROM __dabble_log
+SELECT level, message FROM __dabble_log ORDER BY ts;

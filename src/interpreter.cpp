@@ -112,6 +112,7 @@ void Interpreter::run(const std::vector<ASTPtr>& prog, const std::string& source
         clearProgressLine();
         if (!progress_is_tty) std::cerr << "PROGRESS DONE\n";
     }
+    flushLog();
     if (!source_file.empty()) {
         file_stack.pop_back();
     }
@@ -133,8 +134,11 @@ void Interpreter::execBlock(const std::vector<ASTPtr>& block, Env env, RawEnv ra
                 if constexpr (std::is_same_v<T, IfStmt>)         return "if";
                 if constexpr (std::is_same_v<T, ExpectStmt>)     return "check";
                 if constexpr (std::is_same_v<T, PrintStmt>)      return "print";
+                if constexpr (std::is_same_v<T, LogStmt>)        return "log";
                 if constexpr (std::is_same_v<T, ImportStmt>)     return "import " + x.filename;
                 if constexpr (std::is_same_v<T, ProjectionStmt>) return "projection " + x.name;
+                if constexpr (std::is_same_v<T, ArrLetStmt>)         return x.name + " +=";
+
                 if constexpr (std::is_same_v<T, SQLStmt>) {
                     std::string s = x.sql.substr(0, 40);
                     if (x.sql.size() > 40) s += "…";
@@ -245,14 +249,11 @@ static std::string normaliseSQL(const std::string& sql, bool scalar_context = fa
 }
 
 std::string Interpreter::resolve(const std::string& sql, const Env& env, const RawEnv& raw) {
-    // Pre-pass: expand ...projection_name into its column list.
-    // Done before replaceAll so the expanded SQL can itself contain {{vars}}.
+    // Pre-pass 1: expand ...projection_name into its column list.
     std::string s = sql;
     size_t p = 0;
     while ((p = s.find("...", p)) != std::string::npos) {
-        // Extract identifier after ...
-        size_t start = p + 3;
-        size_t end = start;
+        size_t start = p + 3, end = start;
         while (end < s.size() && (std::isalnum((unsigned char)s[end]) || s[end] == '_')) end++;
         if (end > start) {
             std::string name = s.substr(start, end - start);
@@ -265,6 +266,64 @@ std::string Interpreter::resolve(const std::string& sql, const Env& env, const R
         }
         p++;
     }
+
+    // Pre-pass 2: expand array[index] references.
+    // Handles: data[1], data[-1], data[some_scalar_val]
+    // Resolves to the internal temp table name __arr_{name}_{n}.
+    // Done before replaceAll so the result is a plain identifier DuckDB can use.
+    for (const auto& [arr_name, items] : array_lets) {
+        std::string pattern = arr_name + "[";
+        size_t pos = 0;
+        while ((pos = s.find(pattern, pos)) != std::string::npos) {
+            // Verify left boundary — not part of a longer identifier
+            bool left_ok = (pos == 0) ||
+                           (!std::isalnum((unsigned char)s[pos-1]) && s[pos-1] != '_');
+            if (!left_ok) { pos++; continue; }
+
+            // Find matching closing bracket
+            size_t bracket_start = pos + pattern.size();  // after "name["
+            size_t bracket_end   = s.find(']', bracket_start);
+            if (bracket_end == std::string::npos) { pos++; continue; }
+
+            std::string index_expr = trim(s.substr(bracket_start, bracket_end - bracket_start));
+            if (index_expr.empty()) { pos++; continue; }
+
+            // Evaluate the index expression to an integer.
+            // It may be a literal (-1, 2), a val name, or any scalar SQL expression.
+            int idx = 0;
+            {
+                // Resolve env vars in the index expression first
+                std::string resolved_idx = replaceEnvVars(replaceAll(index_expr, env, raw));
+                // Execute as scalar SQL
+                std::string idx_sql = "SELECT CAST((" + resolved_idx + ") AS INTEGER)";
+                duckdb_result res;
+                if (dbExec(idx_sql, &res).empty() && duckdb_row_count(&res) > 0) {
+                    char* v = duckdb_value_varchar(&res, 0, 0);
+                    if (v) { idx = std::stoi(v); duckdb_free(v); }
+                }
+                duckdb_destroy_result(&res);
+            }
+
+            // Convert to 1-based positive index
+            int n = (int)items.size();
+            if (idx < 0) idx = n + idx + 1;  // -1 → n, -2 → n-1, etc.
+
+            std::string replacement;
+            if (idx < 1 || idx > n) {
+                clearProgressLine();
+                std::cerr << red("error: ") << loc()
+                          << arr_name << "[" << index_expr << "] out of range "
+                          << "(have " << n << " item(s))\n";
+                replacement = arr_name;  // leave as-is, DuckDB will error
+            } else {
+                replacement = items[idx - 1];  // items is 0-based internally
+            }
+
+            s.replace(pos, bracket_end - pos + 1, replacement);
+            pos += replacement.size();
+        }
+    }
+
     return replaceEnvVars(replaceAll(s, env, raw));
 }
 
@@ -463,7 +522,96 @@ void Interpreter::printResult(duckdb_result* res) {
     printf("\n");
 }
 
-// ====================== FUNCTION DEFINITION ======================
+
+// ====================== ARRAY LET ======================
+//
+// Array lets store an ordered list of temp tables named __arr_{name}_{n}.
+// A TEMP VIEW named {name} is recreated on every append as:
+//   SELECT * FROM __arr_{name}_1 UNION BY NAME
+//   SELECT * FROM __arr_{name}_2 UNION BY NAME ...
+//
+// This means:
+//   data += expr          creates __arr_data_N, rebuilds view
+//   data[1]               → SELECT * FROM __arr_data_1
+//   data[-1]              → SELECT * FROM __arr_data_{last}
+//   data[scalar_val]      → resolves scalar, picks __arr_data_N
+//   data                  → view — UNION BY NAME of all items
+//   SELECT * FROM data    → works natively, no rewriting needed
+//
+// ArrLetStmt is emitted for both:
+//   let data[] = []                  → name="data", expr=""  (init empty)
+//   let data[] = [source1, source2]  → name="data", expr="source1, source2"
+//   data += expr                     → name="data", expr="expr"  (append)
+
+void Interpreter::exec(const ArrLetStmt& s, Env& env, RawEnv& raw) {
+    // Split the expression: may be a comma-separated init list or a single expr.
+    // We treat each comma-separated item as one source to append.
+    std::vector<std::string> items;
+    if (!s.expr.empty()) {
+        // Simple split on top-level commas (respecting parens/quotes)
+        int depth = 0; bool in_s = false, in_d = false;
+        std::string cur;
+        for (char c : s.expr) {
+            if (c == '\'' && !in_d) { in_s = !in_s; cur += c; continue; }
+            if (c == '"' && !in_s)  { in_d = !in_d; cur += c; continue; }
+            if (in_s || in_d)        { cur += c; continue; }
+            if (c == '(') { depth++; cur += c; continue; }
+            if (c == ')') { depth--; cur += c; continue; }
+            if (c == ',' && depth == 0) {
+                std::string t = trim(cur);
+                if (!t.empty()) items.push_back(t);
+                cur.clear();
+            } else { cur += c; }
+        }
+        std::string t = trim(cur);
+        if (!t.empty()) items.push_back(t);
+    }
+
+    // Initialise the array entry if this is first use
+    if (!array_lets.count(s.name)) {
+        array_lets[s.name] = {};
+        if (verbose) std::cout << dim("✓ array let " + s.name + " []") << "\n";
+    }
+
+    // Append each item
+    for (const auto& item : items) {
+        auto& arr = array_lets[s.name];
+        int   idx = (int)arr.size() + 1;  // 1-based
+        std::string tbl  = "__arr_" + s.name + "_" + std::to_string(idx);
+        std::string expr = trim(resolve(item, env, raw));
+        std::string norm = normaliseSQL(expr);
+
+        std::string err = dbExec("CREATE OR REPLACE TEMP TABLE " + tbl + " AS " + norm);
+        if (!err.empty()) {
+            clearProgressLine();
+            std::cerr << red("error: ") << loc()
+                      << s.name << " += : " << err << "\n";
+            return;
+        }
+
+        arr.push_back(tbl);
+        known_tables.insert(tbl);
+        if (verbose) std::cout << dim("✓ " + s.name + "[" + std::to_string(idx) + "] = " + item) << "\n";
+
+        // Rebuild the TEMP VIEW so "SELECT * FROM data" always sees all items
+        std::string view_sql = "CREATE OR REPLACE TEMP VIEW " + s.name + " AS ";
+        for (size_t i = 0; i < arr.size(); i++) {
+            if (i > 0) view_sql += "\n    UNION BY NAME ";
+            view_sql += "SELECT * FROM " + arr[i];
+        }
+        view_sql += ";";
+        err = dbExec(view_sql);
+        if (!err.empty()) {
+            clearProgressLine();
+            std::cerr << red("error: ") << loc()
+                      << "rebuilding view for " << s.name << ": " << err << "\n";
+        }
+    }
+    if (verbose && items.empty())
+        std::cout << dim("✓ " + s.name + " initialised (empty)") << "\n";
+}
+
+// ====================== FUNCTION DEFINITION =======================
 
 void Interpreter::exec(const FnStmt& s, Env& env, RawEnv& raw) {
     functions[s.name] = s;
@@ -742,24 +890,48 @@ void Interpreter::exec(const ForStmt& s, Env& env, RawEnv& raw) {
         }
         Env    local     = env;
         RawEnv local_raw = raw;
+
+        // Bind each column of the current row into local env/raw.
+        // env  → getvariable('__val_N_col') so typed values are compared correctly in SQL
+        //        e.g. WHERE category = getvariable(...) compares string to string properly
+        // raw  → actual string value for {{col}} injection
+        // Both are scoped to this iteration and cleaned up after execBlock.
+        std::vector<std::string> row_vars;
         for (idx_t c = 0; c < cols; c++) {
             char* val = duckdb_value_varchar(&res, c, r);
             std::string col   = duckdb_column_name(&res, c);
-            std::string value = val ? val : "NULL";
-            local[s.var + "." + col]     = value;
-            local_raw[s.var + "." + col] = value;
+            std::string value = val ? val : "";
             if (val) duckdb_free(val);
+
+            // Create a DuckDB variable so the value is typed and SQL-safe
+            std::string varname = "__val_" + std::to_string(fn_depth + 1) + "_" + s.var + "_" + col;
+            std::string escaped;
+            for (char ch : value) {
+                if (ch == '\'') escaped += "\'\'";
+                else escaped += ch;
+            }
+            dbExec("SET VARIABLE " + varname + " = '" + escaped + "'");
+            row_vars.push_back(varname);
+
+            local[s.var + "." + col]     = "getvariable('" + varname + "')";
+            local_raw[s.var + "." + col] = value;
         }
-        // Single-column source: bind the bare var name directly.
-        // "for name in customers.name:" -> use `name` not `name.name`
+
+        // Single-column shorthand: bind bare var name too.
+        // "for name in products.name:" → use `name` not `name.name`
         if (cols == 1) {
             char* sv = duckdb_value_varchar(&res, 0, r);
-            std::string sv_val = sv ? sv : "NULL";
-            local[s.var]     = sv_val;
-            local_raw[s.var] = sv_val;
+            std::string sv_val = sv ? sv : "";
             if (sv) duckdb_free(sv);
+            // env: bare name also uses getvariable so it's SQL-safe
+            local[s.var]     = "getvariable('" + row_vars[0] + "')";
+            local_raw[s.var] = sv_val;
         }
+
         execBlock(s.body, local, local_raw);
+
+        // Clean up row variables after each iteration
+        for (auto& v : row_vars) dbExec("RESET VARIABLE " + v);
     }
     if (show_progress && rows > 1) clearProgressLine();
     duckdb_destroy_result(&res);
@@ -799,6 +971,7 @@ void Interpreter::exec(const ExpectStmt& s, Env& env, RawEnv& raw) {
 
         if (s.action == "fail") {
             clearProgressLine(); std::cerr << red("❌ fail: ") << loc() << msg << "\n";
+            flushLog();
             std::exit(1);
         } else {
             clearProgressLine(); std::cerr << yellow("⚠️  warn: ") << loc() << msg << "\n";
@@ -808,57 +981,231 @@ void Interpreter::exec(const ExpectStmt& s, Env& env, RawEnv& raw) {
 
 // ====================== PRINT ======================
 
-void Interpreter::exec(const PrintStmt& s, Env& env, RawEnv& raw) {
-    std::string text = trim(resolve(s.text, env, raw));
+// ====================== SHARED TEXT EVALUATION ======================
+// evalText is the common engine for both print and log.
+// It evaluates a text expression and returns a string result.
+//
+// Three cases:
+//   SELECT/WITH  → execute; if multi-row: set is_multirow=true, populate out_res
+//                  if single cell: return the value as string
+//   expression   → SELECT CAST((expr) AS VARCHAR) — handles vals, arithmetic,
+//                  string concat, arrays, structs
+//   plain text   → returned as-is if DuckDB can't evaluate it
+//
+// The caller decides what to do with multi-row results:
+//   print  → calls printResult() to display as a table
+//   log    → logs metadata: "tablename: N rows"
+
+std::string Interpreter::evalText(const std::string& text, bool& is_multirow,
+                                   duckdb_result* out_res) {
+    is_multirow = false;
 
     std::string upper = text;
     std::transform(upper.begin(), upper.end(), upper.begin(),
                    [](unsigned char c){ return std::toupper(c); });
 
-    // Multi-row SELECT: print as a table.
+    // SELECT/WITH: execute and check result shape
     if (upper.rfind("SELECT", 0) == 0 || upper.rfind("WITH", 0) == 0) {
         duckdb_result res;
         std::string err = dbExec(text, &res);
         if (!err.empty()) {
-            clearProgressLine(); std::cerr << red("error: ") << loc() << "print: " << err << "\n";
+            clearProgressLine();
+            std::cerr << red("error: ") << loc() << "print/log: " << err << "\n";
             duckdb_destroy_result(&res);
-            return;
+            return "";
         }
         idx_t rows = duckdb_row_count(&res);
         idx_t cols = duckdb_column_count(&res);
         if (rows == 1 && cols == 1) {
-            // Single cell: print as plain value, not a table.
+            // Single cell — return as plain string
             char* val = duckdb_value_varchar(&res, 0, 0);
-            if (val) { std::cout << val << "\n"; duckdb_free(val); }
+            std::string result = val ? val : "";
+            if (val) duckdb_free(val);
+            duckdb_destroy_result(&res);
+            return result;
         } else if (rows > 0) {
-            printResult(&res);
+            // Multi-row — caller handles display/logging
+            is_multirow = true;
+            if (out_res) {
+                *out_res = res;  // caller owns the result, must destroy it
+            } else {
+                duckdb_destroy_result(&res);
+            }
+            return "";
         }
         duckdb_destroy_result(&res);
-        return;
+        return "";
     }
 
-    // Expression (may contain scalar subquery fragments from val substitution):
-    // wrap in SELECT (...) so DuckDB evaluates it with proper types.
-    // e.g. print 'total: ' || order_count
-    //   →  SELECT ('total: ' || getvariable('__val_0_order_count'))
+    // Expression — wrap in CAST so any type renders correctly
     {
         duckdb_result res;
-        // Wrap in CAST(... AS VARCHAR) so arrays, structs, maps all render.
         std::string err = dbExec("SELECT CAST((" + text + ") AS VARCHAR)", &res);
         if (!err.empty()) {
-            // Not a SQL expression — just print the raw text.
-            std::cout << text << "\n";
-            return;
+            // Not a SQL expression — return raw text
+            return text;
         }
+        std::string result = text;  // fallback
         if (duckdb_row_count(&res) > 0 && duckdb_column_count(&res) > 0) {
             char* val = duckdb_value_varchar(&res, 0, 0);
-            if (val) { std::cout << val << "\n"; duckdb_free(val); }
+            if (val) { result = val; duckdb_free(val); }
         }
         duckdb_destroy_result(&res);
+        return result;
     }
 }
 
-// ====================== IMPORT ======================
+void Interpreter::exec(const PrintStmt& s, Env& env, RawEnv& raw) {
+    std::string text = trim(resolve(s.text, env, raw));
+    bool is_multirow = false;
+    duckdb_result res;
+    std::string result = evalText(text, is_multirow, &res);
+
+    if (is_multirow) {
+        printResult(&res);
+        duckdb_destroy_result(&res);
+    } else if (!result.empty()) {
+        std::cout << result << "\n";
+    }
+}
+
+
+// ====================== LOGGING ======================
+//
+// All log entries go to __dabble_log (an in-memory temp table).
+// If log_destination is set (via "SET log = 'file.db'" or CLI),
+// entries are also flushed to that file at script end.
+//
+// __dabble_log schema:
+//   ts       TIMESTAMP   — when the entry was written
+//   level    VARCHAR     — debug / info / warn / error
+//   message  VARCHAR     — the evaluated message string
+//   script   VARCHAR     — source filename
+//   line     INTEGER     — source line number
+
+void Interpreter::initLogTable() {
+    if (log_table_ready) return;
+    dbExec(
+        "CREATE TEMP TABLE IF NOT EXISTS __dabble_log ("
+        "  ts      TIMESTAMP DEFAULT NOW(),"
+        "  level   VARCHAR,"
+        "  message VARCHAR,"
+        "  script  VARCHAR,"
+        "  line    INTEGER"
+        ")"
+    );
+    log_table_ready = true;
+}
+
+void Interpreter::writeLog(const std::string& level, const std::string& message) {
+    initLogTable();
+
+    // Escape single quotes in message for the INSERT
+    std::string msg_escaped;
+    for (char c : message) {
+        if (c == '\'') msg_escaped += "\'\'";
+        else msg_escaped += c;
+    }
+
+    std::string script = file_stack.empty() ? "" : file_stack.back();
+    auto slash = script.rfind('/');
+    if (slash != std::string::npos) script = script.substr(slash + 1);
+
+    std::string insert =
+        "INSERT INTO __dabble_log (level, message, script, line) VALUES ('"
+        + level + "', '" + msg_escaped + "', '" + script + "', "
+        + std::to_string(current_line) + ")";
+    dbExec(insert);
+}
+
+void Interpreter::flushLog() {
+    if (!log_table_ready || log_destination.empty()) return;
+
+    // Determine format from extension
+    std::string dest = log_destination;
+    std::string ext;
+    auto dot = dest.rfind('.');
+    if (dot != std::string::npos) ext = dest.substr(dot + 1);
+
+    if (ext == "csv") {
+        dbExec("COPY __dabble_log TO '" + dest + "' (FORMAT CSV, HEADER, APPEND)");
+    } else if (ext == "json" || ext == "ndjson") {
+        dbExec("COPY __dabble_log TO '" + dest + "' (FORMAT JSON, ARRAY false)");
+    } else {
+        // Treat as DuckDB file — ATTACH and INSERT
+        dbExec("ATTACH IF NOT EXISTS '" + dest + "' AS __log_dest");
+        dbExec(
+            "CREATE TABLE IF NOT EXISTS __log_dest.dabble_log AS "
+            "SELECT * FROM __dabble_log WHERE false"
+        );
+        dbExec("INSERT INTO __log_dest.dabble_log SELECT * FROM __dabble_log");
+        dbExec("DETACH __log_dest");
+    }
+    if (verbose) std::cout << dim("✓ log flushed to " + dest) << "\n";
+}
+
+void Interpreter::exec(const LogStmt& s, Env& env, RawEnv& raw) {
+    std::string text = trim(resolve(s.text, env, raw));
+    std::string level = s.level;
+
+    // Skip debug entries unless verbose
+    if (level == "debug" && !verbose) return;
+
+    std::string message;
+
+    // Check if text is a bare known let/array table — log metadata, not data.
+    // Must check AFTER resolve() so val substitution has run, but the text
+    // should still be a plain identifier (no spaces) to match a table name.
+    bool is_bare_table = known_tables.count(text) > 0 ||
+                         array_lets.count(text) > 0;
+
+    if (is_bare_table) {
+        // Log row count as metadata
+        std::string tbl = known_tables.count(text) ? text : text; // view name for array let
+        duckdb_result res;
+        if (dbExec("SELECT COUNT(*) FROM " + tbl, &res).empty() &&
+            duckdb_row_count(&res) > 0) {
+            char* v = duckdb_value_varchar(&res, 0, 0);
+            message = (array_lets.count(text) ? "array:" : "let:") + text +
+                      " — " + (v ? v : "?") + " rows";
+            if (v) duckdb_free(v);
+        }
+        duckdb_destroy_result(&res);
+    } else {
+        // Evaluate via the shared evalText engine — same path as print.
+        // normaliseSQL converts "COUNT(*) FROM t" → "SELECT COUNT(*) FROM t",
+        // and leaves quoted literals 'hello' and full SELECTs unchanged.
+        std::string norm = normaliseSQL(text);
+        bool is_multirow = false;
+        duckdb_result res;
+        message = evalText(norm, is_multirow, &res);
+
+        if (is_multirow) {
+            // Multi-row: log metadata only (data itself stays in the table)
+            idx_t rows = duckdb_row_count(&res);
+            idx_t cols = duckdb_column_count(&res);
+            message = std::to_string(rows) + " rows, " +
+                      std::to_string(cols) + " cols";
+            duckdb_destroy_result(&res);
+        }
+    }
+
+    // Write to log table
+    writeLog(level, message);
+
+    // Print to stderr with level color and timestamp
+    bool colors = isatty(STDERR_FILENO);
+    const char* col =
+        (level == "error") ? (colors ? "\033[1;31m" : "") :
+        (level == "warn")  ? (colors ? "\033[1;33m" : "") :
+        (level == "debug") ? (colors ? "\033[2m"    : "") :
+                             (colors ? "\033[0;36m"  : "");  // info: cyan
+    const char* RST = colors ? "\033[0m" : "";
+
+    std::cerr << col << "[" << level << "] " << RST << message << "\n";
+}
+
+// ====================== IMPORT =======================
 
 void Interpreter::exec(const ImportStmt& s, Env& env, RawEnv& raw) {
     std::filesystem::path base = file_stack.empty()

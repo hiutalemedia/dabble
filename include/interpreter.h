@@ -77,12 +77,18 @@ class Interpreter {
     std::vector<std::string> file_stack;
     int current_line = 0;
     int fn_depth     = 0;
-    std::set<std::string> known_tables;
+    std::set<std::string> known_tables;            // tables created by let
+
+    // Array lets: name → ordered list of internal table names (__arr_{name}_{n}).
+    // A TEMP VIEW named {name} is kept as UNION BY NAME of all items,
+    // so "SELECT * FROM data" works transparently.
+    std::unordered_map<std::string, std::vector<std::string>> array_lets;
     std::vector<std::vector<std::string>> val_scopes = {{}};
 
 public:
     Interpreter(duckdb_connection c, bool verbose = false, bool progress = false);
     void run(const std::vector<ASTPtr>& prog, const std::string& source_file = "");
+    void setLogDestination(const std::string& dest) { log_destination = dest; }
 
 private:
     using Env    = std::unordered_map<std::string,std::string>;
@@ -104,6 +110,8 @@ private:
     void exec(const PrintStmt& s,      Env& env, RawEnv& raw);
     void exec(const ImportStmt& s,     Env& env, RawEnv& raw);
     void exec(const ProjectionStmt& s, Env& env, RawEnv& raw);
+    void exec(const ArrLetStmt& s,     Env& env, RawEnv& raw);
+    void exec(const LogStmt& s,        Env& env, RawEnv& raw);
 
     bool evalCond(std::string cond, Env& env, RawEnv& raw);
     bool isFunctionCall(const std::string& sql, std::string& fn_name,
@@ -111,6 +119,18 @@ private:
     void printResult(duckdb_result* res);
     std::string resolve(const std::string& sql, const Env& env, const RawEnv& raw = {});
     std::string inferFrom(const std::string& expr);
+
+    // Evaluate print/log text to a string. Multi-row results set is_multirow=true
+    // and populate out_res (caller must duckdb_destroy_result).
+    std::string evalText(const std::string& text, bool& is_multirow,
+                         duckdb_result* out_res = nullptr);
+
+    // Logging — __dabble_log table + optional file destination
+    bool        log_table_ready = false;
+    std::string log_destination;
+    void initLogTable();
+    void writeLog(const std::string& level, const std::string& message);
+    void flushLog();
     std::string loc() const;
     std::string dbExec(const std::string& sql, duckdb_result* res = nullptr);
 };
