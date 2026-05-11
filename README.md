@@ -234,16 +234,24 @@ if (COUNT(*) > 0 FROM orders WHERE status = 'pending'):
 
 ### While — `while`
 
+Vals defined outside the loop are visible inside, and mutations propagate back out.
+Bare assignment (`c = expr`) works without repeating the `val` keyword for existing vals.
+
 ```sql
-CREATE TEMP TABLE counter (n INTEGER);
-INSERT INTO counter VALUES (10);
+val offset = 0
+val batch  = 1000
+val total  = COUNT(*) FROM events;
 
-while (SELECT n > 0 FROM counter):
-    print SELECT 'tick: ' || n FROM counter
-    UPDATE counter SET n = n - 1;
+while (offset < total):
+    events WHERE rowid > offset LIMIT batch -> batch_{{offset}}.csv;
+    offset = offset + batch;
+
+-- or a simple counter:
+val c = 10
+while (c > 0):
+    print 'tick: ' || c
+    c = c - 1;
 ```
-
-Scalars can drive the loop — reassigning `val offset = offset + batch_size` updates the variable each iteration.
 
 ---
 

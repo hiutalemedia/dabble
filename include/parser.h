@@ -12,6 +12,7 @@ public:
     std::vector<ASTPtr> parseBlock(int baseIndent = 0);
 
 private:
+    int detectIndentStep(int baseIndent);
     std::string collectSQL(int minIndent, std::string& redirect_file, bool& append);
     ASTPtr parseLet(int baseIndent);    // let / table  → temp table
     ASTPtr parseVal(int baseIndent);    // val / scalar → env string

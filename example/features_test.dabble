@@ -53,7 +53,7 @@ let paid = SELECT o.*, p.name AS product_name, p.category, p.price, p.cost
     JOIN products p ON p.id = o.product_id
     WHERE o.status = 'paid';
 
-table electronics = SELECT * FROM paid WHERE category = 'electronics';
+table electronics = paid WHERE category = 'electronics';
 
 print SELECT 'paid orders: ' || COUNT(*) FROM paid
 print SELECT 'electronics: ' || COUNT(*) FROM electronics
@@ -103,10 +103,10 @@ let with_margins  = SELECT ...order_core, ...margin_cols FROM paid;
 let by_customer   = SELECT ...customer_stats FROM paid GROUP BY customer ORDER BY total_spent DESC;
 
 print 'Order details (top 3):'
-SELECT * FROM order_details LIMIT 3;
+order_details LIMIT 3;
 
 print 'By customer:'
-by_customer
+by_customer;
 
 -- ── 5. FUNCTIONS WITH PARAMS ─────────────────────────────────
 
@@ -146,13 +146,13 @@ print SELECT 'medium paid orders (qty>=' || min_qty || '): ' || COUNT(*) FROM me
 
 -- Standalone calls print directly
 print 'Electronics revenue:'
-category_revenue('electronics')
+category_revenue('electronics');
 
 print 'Food revenue:'
-category_revenue('food')
+category_revenue('food');
 
 print 'Top 3 customers:'
-top_customers(3)
+top_customers(3);
 
 -- Materialise fn result, then export
 let top3 = top_customers(3)
@@ -201,15 +201,13 @@ if (COUNT(*) > 0 FROM paid WHERE category = 'electronics'):
 else:
     print 'No electronics sold'
 
--- while with counter
-CREATE TEMP TABLE counter (n INTEGER);
-INSERT INTO counter VALUES (3);
+-- while with val counter — bare reassignment (no val keyword needed)
+val c = 3
+while (c > 0):
+    print '  countdown: ' || c
+    c = c - 1;
 
-while (SELECT n > 0 FROM counter):
-    print SELECT '  countdown: ' || n FROM counter
-    UPDATE counter SET n = n - 1;
-
-print 'Done counting'
+print 'Done counting, c = ' || c
 
 -- ── 8. CHECK / EXPECT ────────────────────────────────────────
 
@@ -268,8 +266,8 @@ print ''
 print '── 11. export ──'
 
 -- Named table shorthand export
-top3 -> /tmp/dabble_test_top_customers.csv
-by_customer -> /tmp/dabble_test_by_customer.csv
+top3 -> /tmp/dabble_test_top_customers.csv;
+by_customer -> /tmp/dabble_test_by_customer.csv;
 
 -- Append mode
 SELECT 'test ran at ' || NOW() AS log_entry >> /tmp/dabble_test_log.csv

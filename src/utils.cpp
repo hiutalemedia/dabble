@@ -18,10 +18,11 @@ std::string trim(const std::string& s) {
 }
 
 int indentLevel(const std::string& line) {
+    // Tabs are normalized to spaces in the Parser constructor,
+    // so we only need to count spaces here.
     int c = 0;
     for (char ch : line) {
         if (ch == ' ') c++;
-        else if (ch == '\t') c += 4;
         else break;
     }
     return c;
@@ -45,22 +46,37 @@ std::string replaceAll(std::string s,
     }
     // bare name — typed value reference, injects getvariable() fragment.
     // Only from env (loop vars and for-loop columns).
-    // Skips any match that falls inside a {{...}} template marker so bare
-    // substitution never clobbers unresolved template expressions.
+    // Skips matches inside {{...}} templates and inside SQL string literals
+    // so bare substitution never clobbers quoted strings like 'c = ' or column names.
     for (const auto& [k, v] : env) {
         size_t pos = 0;
         while ((pos = s.find(k, pos)) != std::string::npos) {
             bool left_ok = (pos == 0) || (!std::isalnum(s[pos - 1]) && s[pos - 1] != '.' && s[pos - 1] != '_');
             bool right_ok = (pos + k.size() == s.size()) || (!std::isalnum(s[pos + k.size()]) && s[pos + k.size()] != '.');
 
-            // Skip if match is inside a {{...}} template — raw loop handles those
+            // Skip if inside a {{...}} template
             bool in_template = false;
             if (pos >= 2 && s[pos - 1] == '{' && s[pos - 2] == '{') {
                 size_t close = s.find("}}", pos + k.size());
                 if (close != std::string::npos) in_template = true;
             }
 
-            if (left_ok && right_ok && !in_template) {
+            // Skip if inside a SQL string literal (single-quoted)
+            // Count unescaped single quotes before this position — odd count means inside string
+            bool in_string = false;
+            {
+                int quotes = 0;
+                for (size_t i = 0; i < pos; i++) {
+                    if (s[i] == '\'') {
+                        // Skip escaped quotes ('')
+                        if (i + 1 < pos && s[i + 1] == '\'') { i++; continue; }
+                        quotes++;
+                    }
+                }
+                in_string = (quotes % 2 != 0);
+            }
+
+            if (left_ok && right_ok && !in_template && !in_string) {
                 s.replace(pos, k.size(), v);
                 pos += v.size();
             } else {

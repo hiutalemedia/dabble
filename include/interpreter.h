@@ -1,4 +1,31 @@
 #pragma once
+// ─────────────────────────────────────────────────────────────────────────────
+// interpreter.h — Dabble tree-walking interpreter
+//
+// Key design decisions:
+//
+//   Env (env map)     bare name → getvariable('__val_N_name')
+//                     Typed DuckDB variables.  Safe for dates, decimals, lists.
+//
+//   RawEnv (raw map)  {{name}} → actual string value
+//                     Used for dynamic SQL construction (fragments, identifiers).
+//
+//   Functions         never touch DuckDB during the body.  let statements become
+//                     CTEs; the final SELECT is returned as FnResult.  The caller
+//                     either materialises it (let x = fn()) or executes and prints.
+//
+//   Val scopes        every val creates a DuckDB variable __val_{depth}_{name}.
+//                     On function return, all variables in the current scope are
+//                     RESET VARIABLE'd.  Top-level vals live for the script lifetime.
+//
+//   known_tables      populated when a let succeeds, used by inferFrom() to
+//                     automatically append "FROM table" to bare expressions.
+//
+//   normaliseSQL()    free function — ensures every SQL string is a valid SELECT
+//                     before being sent to DuckDB.  Eliminates the need for
+//                     callers to know whether they have a bare expression, a
+//                     FROM clause, or a full SELECT.
+// ─────────────────────────────────────────────────────────────────────────────
 #include "ast.h"
 #include "duckdb.h"
 #include <unordered_map>
@@ -78,7 +105,7 @@ private:
     void exec(const ImportStmt& s,     Env& env, RawEnv& raw);
     void exec(const ProjectionStmt& s, Env& env, RawEnv& raw);
 
-    bool evalCond(std::string cond, Env& env);
+    bool evalCond(std::string cond, Env& env, RawEnv& raw);
     bool isFunctionCall(const std::string& sql, std::string& fn_name,
                         std::vector<std::string>& args);
     void printResult(duckdb_result* res);

@@ -120,11 +120,129 @@ void Interpreter::run(const std::vector<ASTPtr>& prog, const std::string& source
 void Interpreter::execBlock(const std::vector<ASTPtr>& block, Env env, RawEnv raw, bool top_level) {
     for (auto& n : block) {
         current_line = n->line_no;  // keep loc() current
+
+        if (top_level && show_progress) {
+            current_stmt++;
+            std::string label = std::visit([](auto&& x) -> std::string {
+                using T = std::decay_t<decltype(x)>;
+                if constexpr (std::is_same_v<T, LetStmt>)        return "let " + x.name;
+                if constexpr (std::is_same_v<T, ValStmt>)        return "val " + x.name;
+                if constexpr (std::is_same_v<T, FnStmt>)         return "fn " + x.name + "()";
+                if constexpr (std::is_same_v<T, ForStmt>)        return "for " + x.var;
+                if constexpr (std::is_same_v<T, WhileStmt>)      return "while";
+                if constexpr (std::is_same_v<T, IfStmt>)         return "if";
+                if constexpr (std::is_same_v<T, ExpectStmt>)     return "check";
+                if constexpr (std::is_same_v<T, PrintStmt>)      return "print";
+                if constexpr (std::is_same_v<T, ImportStmt>)     return "import " + x.filename;
+                if constexpr (std::is_same_v<T, ProjectionStmt>) return "projection " + x.name;
+                if constexpr (std::is_same_v<T, SQLStmt>) {
+                    std::string s = x.sql.substr(0, 40);
+                    if (x.sql.size() > 40) s += "…";
+                    return s;
+                }
+                return "";
+            }, n->node);
+            emitProgress(label);
+        }
+
         std::visit([&](auto&& x){ exec(x, env, raw); }, n->node);
     }
 }
 
 // ====================== HELPERS ======================
+
+// Normalise a SQL expression to a full SELECT statement.
+//
+//   SELECT/WITH/DML  → pass through unchanged
+//   (SELECT ...)     → SELECT * FROM (SELECT ...)  — subquery expression
+//   FROM ...         → SELECT * FROM ...
+//   expr FROM ...    → SELECT expr FROM ...
+//   ident [clauses]  → SELECT * FROM ident [clauses]  (table shorthand)
+//   bare_ident       → SELECT * FROM ident
+//   literal/expr     → SELECT (expr)  — scalar
+//
+// SQL clause keywords (WHERE, ORDER, LIMIT, etc.) after a first identifier
+// signal a table shorthand — the whole expression is a table source.
+// scalar_context=true: bare idents wrap as SELECT (expr) — used for val/fn params
+// scalar_context=false: bare idents become SELECT * FROM name — used for let/sql stmts
+static std::string normaliseSQL(const std::string& sql, bool scalar_context = false) {
+    if (sql.empty()) return sql;
+
+    std::string trimmed = trim(sql);
+    std::string up = trimmed;
+    std::transform(up.begin(), up.end(), up.begin(),
+                   [](unsigned char c){ return std::toupper(c); });
+
+    // Pass through: already a full query
+    if (up.rfind("SELECT", 0) == 0 || up.rfind("WITH", 0) == 0)
+        return trimmed;
+
+    // Pass through: DML — never wrap in SELECT
+    if (up.rfind("CREATE", 0) == 0 || up.rfind("INSERT", 0) == 0 ||
+        up.rfind("UPDATE", 0) == 0 || up.rfind("DELETE", 0) == 0 ||
+        up.rfind("DROP",   0) == 0 || up.rfind("ALTER",  0) == 0 ||
+        up.rfind("COPY",   0) == 0 || up.rfind("ATTACH", 0) == 0 ||
+        up.rfind("DETACH", 0) == 0 || up.rfind("LOAD",   0) == 0 ||
+        up.rfind("INSTALL",0) == 0 || up.rfind("SET ",   0) == 0)
+        return trimmed;
+
+    // Subquery expression: starts with ( — wrap as subquery source
+    if (trimmed[0] == '(')
+        return "SELECT * FROM " + trimmed;
+
+    // Find top-level FROM (not inside parens or string literals)
+    int depth = 0; bool in_s = false, in_d = false;
+    size_t from_pos = std::string::npos;
+    for (size_t i = 0; i < up.size(); i++) {
+        char c = up[i];
+        if (c == '\'' && !in_d) { in_s = !in_s; continue; }
+        if (c == '"'  && !in_s) { in_d = !in_d; continue; }
+        if (in_s || in_d) continue;
+        if (c == '(') { depth++; continue; }
+        if (c == ')') { depth--; continue; }
+        if (depth == 0 && up.substr(i, 5) == "FROM " && (i == 0 || up[i-1] == ' ')) {
+            from_pos = i; break;
+        }
+    }
+
+    if (from_pos != std::string::npos) {
+        if (from_pos == 0) return "SELECT * " + trimmed; // FROM first
+        return "SELECT " + trimmed;                       // expr FROM table
+    }
+
+    // No FROM — determine if this is a table shorthand or a scalar expression.
+    // SQL clause keywords after a first identifier signal a table shorthand:
+    //   paid WHERE status = 'paid'  → SELECT * FROM paid WHERE status = 'paid'
+    //   summary LIMIT 10            → SELECT * FROM summary LIMIT 10
+    // Pure scalars/literals have no such keywords:
+    //   100, CURRENT_DATE, total > 500  → SELECT (expr)
+    static const char* table_clauses[] = {
+        "WHERE ", "ORDER ", "GROUP ", "LIMIT ", "HAVING ",
+        "JOIN ", "LEFT ", "RIGHT ", "INNER ", "OUTER ",
+        "CROSS ", "FULL ", "UNION ", "EXCEPT ", "INTERSECT ",
+        "OFFSET ", "QUALIFY ", "WINDOW ", nullptr
+    };
+    for (int i = 0; table_clauses[i]; i++) {
+        // Must appear after at least one word (the table name)
+        size_t kw_pos = up.find(table_clauses[i]);
+        if (kw_pos != std::string::npos && kw_pos > 0 && up[kw_pos - 1] == ' ')
+            return "SELECT * FROM " + trimmed;
+    }
+
+    // Bare identifier: letters, digits, underscores only.
+    // In scalar_context (val/fn params), treat as expression — SELECT (expr).
+    // In table context (let/sql stmts), treat as table name — SELECT * FROM name.
+    // Always scalar if starts with digit (numeric literal like 100, 3.14).
+    bool is_bare = !trimmed.empty() && !std::isdigit((unsigned char)trimmed[0]);
+    if (is_bare) {
+        for (char c : trimmed)
+            if (!std::isalnum((unsigned char)c) && c != '_') { is_bare = false; break; }
+    }
+    if (is_bare && !scalar_context) return "SELECT * FROM " + trimmed;
+
+    // Scalar expression (or scalar_context with bare ident)
+    return "SELECT (" + trimmed + ")";
+}
 
 std::string Interpreter::resolve(const std::string& sql, const Env& env, const RawEnv& raw) {
     // Pre-pass: expand ...projection_name into its column list.
@@ -298,38 +416,13 @@ std::string Interpreter::inferFrom(const std::string& expr) {
     return expr;
 }
 
-bool Interpreter::evalCond(std::string cond, Env& env) {
-    cond = resolve(cond, env);
+bool Interpreter::evalCond(std::string cond, Env& env, RawEnv& raw) {
+    cond = resolve(cond, env, raw);
 
-    // Build a normalised SELECT from the condition expression.
-    // Three cases:
-    //   1. Already a full query: "SELECT COUNT(*) > 0 FROM orders" → use as-is
-    //   2. Has a FROM clause but no SELECT: "COUNT(*) > 0 FROM orders" → prepend SELECT
-    //   3. Pure expression: "total > 500" → wrap in SELECT (...)
-    std::string upper = cond;
-    std::transform(upper.begin(), upper.end(), upper.begin(),
-                   [](unsigned char c){ return std::toupper(c); });
-
-    std::string normalised;
-    if (upper.rfind("SELECT", 0) == 0 || upper.rfind("WITH", 0) == 0) {
-        normalised = cond;                      // already a full query
-    } else if (upper.find(" FROM ") != std::string::npos) {
-        normalised = "SELECT " + cond;          // has FROM, just needs SELECT
-    } else {
-        // No FROM — try to infer it from known tables
-        std::string inferred = inferFrom(cond);
-        if (inferred != cond) {
-            normalised = "SELECT " + inferred;  // successfully inferred FROM
-        } else {
-            normalised = "SELECT (" + cond + ")";  // pure scalar expression
-        }
-    }
-
-    std::string query = "SELECT 1 FROM (" + normalised + ") AS _cond_src WHERE (" +
-                        normalised + ") IS TRUE LIMIT 1";
-
-    // Simpler single-evaluation form using the normalised query as a subquery:
-    query = "SELECT 1 FROM (SELECT (" + normalised + ") AS _cond) WHERE _cond IS TRUE LIMIT 1";
+    // Normalise to a full SELECT (handles bare expressions, FROM-only, and full queries).
+    // Then wrap in a subquery so the condition is evaluated exactly once.
+    std::string normalised = normaliseSQL(inferFrom(cond));
+    std::string query = "SELECT 1 FROM (SELECT (" + normalised + ") AS _cond) WHERE _cond IS TRUE LIMIT 1";
 
     duckdb_result res;
     std::string err = dbExec(query, &res);
@@ -440,19 +533,8 @@ FnResult Interpreter::execFn(const FnStmt& fn, Env env,
             expr = resolve(raw_arg, env, raw);  // substitute outer-scope vars
         }
 
-        std::string upper = expr;
-        std::transform(upper.begin(), upper.end(), upper.begin(),
-                       [](unsigned char c){ return std::toupper(c); });
-        std::string value_expr;
-        if (upper.rfind("SELECT", 0) == 0 || upper.rfind("WITH", 0) == 0) {
-            value_expr = "(" + expr + ")";
-        } else if (upper.find(" FROM ") != std::string::npos) {
-            value_expr = "(SELECT " + expr + ")";
-        } else if (upper.rfind("GETVARIABLE(", 0) == 0) {
-            value_expr = "(" + expr + ")";  // already a scalar call
-        } else {
-            value_expr = "(SELECT (" + expr + "))";
-        }
+        // scalar_context=true: fn params are always scalar values, never table names
+        std::string value_expr = "(" + normaliseSQL(expr, true) + ")";
 
         std::string varname = "__val_" + std::to_string(fn_depth) + "_" + param;
         std::string err = dbExec("SET VARIABLE " + varname + " = " + value_expr);
@@ -537,23 +619,7 @@ void Interpreter::exec(const LetStmt& s, Env& env, RawEnv& raw) {
         return;
     }
 
-    // If the RHS doesn't start with a SQL query keyword, wrap in SELECT * FROM.
-    // This lets you write:
-    //   let data   = read_csv('mydata.csv')
-    //   let events = read_parquet('s3://bucket/*.parquet')
-    // instead of the more verbose SELECT * FROM form.
-    std::string upper_sql = sql;
-    std::transform(upper_sql.begin(), upper_sql.end(), upper_sql.begin(),
-                   [](unsigned char c){ return std::toupper(c); });
-    static const std::vector<std::string> query_starts = {
-        "SELECT", "WITH", "FROM", "VALUES", "TABLE"
-    };
-    bool is_query = false;
-    for (const auto& kw : query_starts) {
-        if (upper_sql.rfind(kw, 0) == 0) { is_query = true; break; }
-    }
-    if (!is_query) sql = "SELECT * FROM (" + sql + ")";
-
+    sql = normaliseSQL(sql);
     std::string full = "CREATE OR REPLACE TEMP TABLE " + s.name + " AS " + sql;
     std::string err = dbExec(full);
     if (!err.empty()) {
@@ -571,6 +637,36 @@ void Interpreter::exec(const LetStmt& s, Env& env, RawEnv& raw) {
 // Subsequent statements in the same block see it via {{name}} or bare name.
 
 void Interpreter::exec(const ValStmt& s, Env& env, RawEnv& raw) {
+    // Guard: val name must not clash with any column name in known tables.
+    // A val named "amount" would silently shadow a column called "amount"
+    // in every subsequent query — an error here is much safer.
+    // Skip check on reassignment (env.count > 0) — already validated at first definition.
+    if (!known_tables.empty() && !env.count(s.name)) {
+        std::string in_list;
+        for (const auto& t : known_tables) {
+            if (!in_list.empty()) in_list += ",";
+            in_list += "'" + t + "'";
+        }
+        std::string col_q =
+            "SELECT table_name, column_name FROM information_schema.columns "
+            "WHERE table_schema = 'temp' AND table_name IN (" + in_list + ") "
+            "AND column_name = '" + s.name + "' LIMIT 1";
+        duckdb_result col_res;
+        if (dbExec(col_q, &col_res).empty() && duckdb_row_count(&col_res) > 0) {
+            char* tbl = duckdb_value_varchar(&col_res, 0, 0);
+            std::string tbl_name = tbl ? tbl : "?";
+            if (tbl) duckdb_free(tbl);
+            duckdb_destroy_result(&col_res);
+            clearProgressLine();
+            std::cerr << red("error: ") << loc()
+                      << "val '" << s.name << "' conflicts with column '"
+                      << s.name << "' in table '" << tbl_name
+                      << "' — choose a different name\n";
+            return;
+        }
+        duckdb_destroy_result(&col_res);
+    }
+
     std::string expr = trim(resolve(s.expr, env, raw));
 
     // Use DuckDB SET VARIABLE so the value is stored with its original type
@@ -580,27 +676,10 @@ void Interpreter::exec(const ValStmt& s, Env& env, RawEnv& raw) {
     //
     // Bare expressions (42, CURRENT_DATE - INTERVAL 30 DAYS) are wrapped in
     // SELECT so DuckDB evaluates them before storing.
-    std::string upper = expr;
-    std::transform(upper.begin(), upper.end(), upper.begin(),
-                   [](unsigned char c){ return std::toupper(c); });
-    // Three cases — mirrors evalCond normalisation:
-    //   "SELECT ..." / "WITH ..."   → already a full query, use as-is
-    //   "expr FROM table"           → has FROM, just prepend SELECT
-    //   "42" / "CURRENT_DATE - ..." → pure expression, wrap in SELECT (...)
-    std::string value_expr;
-    if (upper.rfind("SELECT", 0) == 0 || upper.rfind("WITH", 0) == 0) {
-        value_expr = "(" + expr + ")";
-    } else if (upper.find(" FROM ") != std::string::npos) {
-        value_expr = "(SELECT " + expr + ")";
-    } else {
-        // No FROM — try to infer it from known tables
-        std::string inferred = inferFrom(expr);
-        if (inferred != expr) {
-            value_expr = "(SELECT " + inferred + ")";
-        } else {
-            value_expr = "(SELECT (" + expr + "))";
-        }
-    }
+    // Normalise to a full SELECT — handles bare expressions, FROM-only, and full queries.
+    // scalar_context=true: never treat bare ident as table name for val
+    std::string normalised = normaliseSQL(inferFrom(expr), true);
+    std::string value_expr = "(" + normalised + ")";
 
     // Scope-prefix the variable name so function-local vals never collide
     // with same-named vals at outer scopes.
@@ -641,14 +720,10 @@ void Interpreter::exec(const ValStmt& s, Env& env, RawEnv& raw) {
 // ====================== FOR =======================
 
 void Interpreter::exec(const ForStmt& s, Env& env, RawEnv& raw) {
-    // Support both bare table names and inline queries as source.
-    std::string source = trim(s.source);
-    std::string upper = source;
-    std::transform(upper.begin(), upper.end(), upper.begin(),
-                   [](unsigned char c){ return std::toupper(c); });
-    std::string q = (upper.rfind("SELECT", 0) == 0 || upper.rfind("WITH", 0) == 0)
-        ? source
-        : "SELECT * FROM " + source;
+    // Normalise source — bare table name, inline query, or full SELECT all work.
+    // The resolve() is done here so {{vars}} in the source are expanded.
+    std::string source = trim(resolve(s.source, env, raw));
+    std::string q = normaliseSQL(source);
 
     duckdb_result res;
     std::string err = dbExec(q, &res);
@@ -693,7 +768,7 @@ void Interpreter::exec(const ForStmt& s, Env& env, RawEnv& raw) {
 // ====================== IF / WHILE =======================
 
 void Interpreter::exec(const IfStmt& s, Env& env, RawEnv& raw) {
-    if (evalCond(s.cond, env)) {
+    if (evalCond(s.cond, env, raw)) {
         execBlock(s.thenb, env, raw);
     } else {
         execBlock(s.elseb, env, raw);
@@ -702,15 +777,22 @@ void Interpreter::exec(const IfStmt& s, Env& env, RawEnv& raw) {
 
 void Interpreter::exec(const WhileStmt& s, Env& env, RawEnv& raw) {
     if (verbose) std::cout << dim("→ while") << "\n";
-    while (evalCond(s.cond, env)) {
-        execBlock(s.body, env, raw);
+    // Execute body with env/raw passed by reference so val assignments
+    // inside the loop body are visible on the next condition check.
+    // This is intentionally different from for loops — while is imperative,
+    // mutations are expected to propagate (val c = c + 1 drives the loop).
+    while (evalCond(s.cond, env, raw)) {
+        for (auto& n : s.body) {
+            current_line = n->line_no;
+            std::visit([&](auto&& x){ exec(x, env, raw); }, n->node);
+        }
     }
 }
 
 // ====================== EXPECT ======================
 
 void Interpreter::exec(const ExpectStmt& s, Env& env, RawEnv& raw) {
-    if (!evalCond(s.condition, env)) {
+    if (!evalCond(s.condition, env, raw)) {
         std::string msg = s.message.empty()
             ? "expectation failed: " + s.condition
             : s.message;
@@ -807,53 +889,78 @@ void Interpreter::exec(const ImportStmt& s, Env& env, RawEnv& raw) {
 // ====================== SQL ======================
 
 void Interpreter::exec(const SQLStmt& s, Env& env, RawEnv& raw) {
+    // Check bare assignment on the ORIGINAL sql BEFORE resolve().
+    // After resolve(), "c" becomes "getvariable('__val_0_c')" — no longer
+    // a plain identifier — so the assignment check must see the raw source.
+    if (s.redirect_file.empty()) {
+        std::string orig = trim(s.sql);
+        auto eq = orig.find('=');
+        if (eq != std::string::npos && eq > 0) {
+            char before = orig[eq - 1];
+            std::string full_upper = orig;
+            std::transform(full_upper.begin(), full_upper.end(), full_upper.begin(),
+                           [](unsigned char c){ return std::toupper(c); });
+            bool has_from = full_upper.find(" FROM ") != std::string::npos;
+
+            if (before != '!' && before != '<' && before != '>' && before != '='
+                && !has_from) {
+                std::string lhs = trim(orig.substr(0, eq));
+                bool is_ident = !lhs.empty();
+                for (char c : lhs)
+                    if (!std::isalnum((unsigned char)c) && c != '_') { is_ident = false; break; }
+
+                if (is_ident && env.count(lhs)) {
+                    // Resolve only the RHS, then dispatch as val reassignment
+                    std::string rhs = trim(resolve(orig.substr(eq + 1), env, raw));
+                    ValStmt vs{lhs, rhs};
+                    exec(vs, env, raw);
+                    return;
+                }
+            }
+        }
+    }
+
     std::string sql = trim(resolve(s.sql, env, raw));
     if (sql.empty()) return;
 
-    // Bare table name shorthand: a single plain identifier (letters, digits, _)
-    // with no spaces is treated as SELECT * FROM name. Lets you write:
-    //   let result = fn()
-    //   result          ← prints the table
+    // Check for Dabble function call BEFORE normaliseSQL — otherwise
+    // fn_name() becomes SELECT (fn_name()) which DuckDB tries to execute
+    // as a SQL scalar function.
     {
-        std::string t = sql;
-        if (!t.empty() && t.back() == ';') t.pop_back();
-        t = trim(t);
-        bool is_ident = !t.empty();
-        for (char c : t) {
-            if (!std::isalnum((unsigned char)c) && c != '_') { is_ident = false; break; }
+        std::string fn_name; std::vector<std::string> fn_args;
+        if (isFunctionCall(sql, fn_name, fn_args) && functions.count(fn_name)) {
+            if (verbose) std::cout << dim("→ calling " + fn_name + "()") << "\n";
+            FnResult r = execFn(functions[fn_name], env, fn_args, raw);
+            std::string built = r.build();
+            if (!built.empty()) {
+                if (!s.redirect_file.empty()) {
+                    std::string copy_sql = "COPY (" + built + ") TO '" + s.redirect_file +
+                                           "' (FORMAT CSV, HEADER" + (s.append ? ", APPEND" : "") + ")";
+                    std::string err = dbExec(copy_sql);
+                    for (auto& v : r.vars_to_reset) dbExec("RESET VARIABLE " + v);
+                    if (!err.empty())
+                        clearProgressLine(), std::cerr << red("error: ") << loc() << "export " << fn_name << "(): " << err << "\n";
+                    else if (verbose)
+                        std::cout << dim("→ exported to " + s.redirect_file) << "\n";
+                } else {
+                    duckdb_result res;
+                    std::string err = dbExec(built, &res);
+                    for (auto& v : r.vars_to_reset) dbExec("RESET VARIABLE " + v);
+                    if (!err.empty())
+                        clearProgressLine(), std::cerr << red("error: ") << loc() << fn_name << "(): " << err << "\n";
+                    else
+                        printResult(&res);
+                    duckdb_destroy_result(&res);
+                }
+            }
+            return;
         }
-        if (is_ident) sql = "SELECT * FROM " + t;
     }
 
-    // Standalone function call
-    std::string fn_name; std::vector<std::string> fn_args;
-    if (isFunctionCall(sql, fn_name, fn_args) && functions.count(fn_name)) {
-        if (verbose) std::cout << dim("→ calling " + fn_name + "()") << "\n";
-        FnResult r = execFn(functions[fn_name], env, fn_args, raw);
-        std::string built = r.build();
-        if (built.empty()) return;
+    // Normalise: bare table names, FROM expressions, or full SELECTs all work uniformly
+    sql = normaliseSQL(sql);
 
-        if (!s.redirect_file.empty()) {
-            std::string copy_sql = "COPY (" + built + ") TO '" + s.redirect_file +
-                                   "' (FORMAT CSV, HEADER" + (s.append ? ", APPEND" : "") + ")";
-            std::string err = dbExec(copy_sql);
-            for (auto& v : r.vars_to_reset) dbExec("RESET VARIABLE " + v);
-            if (!err.empty()) {
-                clearProgressLine(); std::cerr << red("error: ") << loc() << "export " << fn_name << "(): " << err << "\n";
-            } else if (verbose)
-                std::cout << dim("→ exported to " + s.redirect_file) << "\n";
-        } else {
-            duckdb_result res;
-            std::string err = dbExec(built, &res);
-            for (auto& v : r.vars_to_reset) dbExec("RESET VARIABLE " + v);
-            if (!err.empty()) {
-                clearProgressLine(); std::cerr << red("error: ") << loc() << fn_name << "(): " << err << "\n";
-            } else
-                printResult(&res);
-            duckdb_destroy_result(&res);
-        }
-        return;
-    }
+
 
     // Redirect to file
     if (!s.redirect_file.empty()) {
@@ -876,12 +983,13 @@ void Interpreter::exec(const SQLStmt& s, Env& env, RawEnv& raw) {
         return;
     }
 
-    std::string up = sql;
-    std::transform(up.begin(), up.end(), up.begin(), [](unsigned char c){ return std::toupper(c); });
-    bool is_query = up.rfind("SELECT", 0) == 0 || up.rfind("WITH", 0) == 0;
-
-    if (is_query && duckdb_column_count(&res) > 0) {
-        printResult(&res);
+    // Print result only for SELECT/WITH — DML returns a "Count" column we suppress.
+    {
+        std::string up2 = sql;
+        std::transform(up2.begin(), up2.end(), up2.begin(),
+                       [](unsigned char c){ return std::toupper(c); });
+        bool is_select = up2.rfind("SELECT", 0) == 0 || up2.rfind("WITH", 0) == 0;
+        if (is_select && duckdb_column_count(&res) > 0) printResult(&res);
     }
     duckdb_destroy_result(&res);
 }

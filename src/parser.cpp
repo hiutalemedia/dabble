@@ -8,11 +8,40 @@ Parser::Parser(const std::string& src) {
     std::stringstream ss(src);
     std::string line;
     while (std::getline(ss, line)) {
-        lines.push_back(line);
+        // Normalize leading tabs to 4 spaces so the rest of the parser
+        // only ever sees space-based indentation.  Tabs inside strings
+        // and comments are left untouched.
+        std::string normalized;
+        bool leading = true;
+        for (char c : line) {
+            if (leading && c == '\t') {
+                normalized += "    ";
+            } else {
+                leading = (c == ' ') && leading ? true : false;
+                normalized += c;
+            }
+        }
+        lines.push_back(normalized);
     }
 }
 
-// ====================== MAIN PARSER ======================
+
+// Detect the indentation step used by the first indented line after the
+// current position.  Handles 2-space, 4-space, and any other consistent
+// indentation — the step is whatever the author actually typed.
+// Falls back to 4 if no indented line is found (empty block).
+int Parser::detectIndentStep(int baseIndent) {
+    for (int i = pos; i < (int)lines.size(); i++) {
+        int lvl = indentLevel(lines[i]);
+        std::string t = trim(lines[i]);
+        if (t.empty() || t.rfind("--", 0) == 0) continue;
+        if (lvl > baseIndent) return lvl - baseIndent;
+        if (lvl <= baseIndent) break;
+    }
+    return 4;
+}
+
+// ====================== MAIN PARSER =======================
 
 std::vector<ASTPtr> Parser::parseBlock(int baseIndent) {
     std::vector<ASTPtr> block;
@@ -56,32 +85,27 @@ std::vector<ASTPtr> Parser::parseBlock(int baseIndent) {
 // ====================== HELPERS ======================
 
 std::string Parser::collectSQL(int minIndent, std::string& redirect_file, bool& append) {
-    // A SQL statement spans multiple lines until:
-    //   a) a line ends with a semicolon  → that line ends the statement
-    //   b) a Dabble keyword is encountered at the base indent → new statement
-    //   c) indentation drops below minIndent → end of block
-    // Single-line statements don't need a semicolon.
-    // Multi-line statements do — this is unambiguous and requires no heuristics.
+    // Simple rule: collect lines until a semicolon, a Dabble keyword,
+    // or indentation drops below minIndent. No heuristics.
+    // Every statement must end with ; — this makes parsing unambiguous.
     std::string sql;
     while (pos < (int)lines.size()) {
         int lvl = indentLevel(lines[pos]);
         if (lvl < minIndent) break;
 
         std::string t = trim(lines[pos]);
-        if (t.empty() || t.rfind("--", 0) == 0) {
-            pos++;
-            continue;
-        }
+        if (t.empty() || t.rfind("--", 0) == 0) { pos++; continue; }
 
         // Dabble keywords always start a new statement
         if (t.rfind("let ", 0) == 0 || t.rfind("table ", 0) == 0 ||
             t.rfind("val ", 0) == 0 || t.rfind("scalar ", 0) == 0 ||
             t.rfind("for ", 0) == 0 || t.rfind("if ", 0) == 0 ||
             t.rfind("while ", 0) == 0 || t.rfind("expect ", 0) == 0 ||
-            t.rfind("fn ", 0) == 0 || t.rfind("print ", 0) == 0 ||
-            t.rfind("import ", 0) == 0 || t.rfind("else", 0) == 0 ||
-            t.rfind("projection ", 0) == 0 || t.rfind("proj ", 0) == 0 ||
-            t.rfind("columns ", 0) == 0 || t.rfind("cols ", 0) == 0) {
+            t.rfind("check ", 0) == 0 || t.rfind("fn ", 0) == 0 ||
+            t.rfind("print ", 0) == 0 || t.rfind("import ", 0) == 0 ||
+            t.rfind("else", 0) == 0 || t.rfind("projection ", 0) == 0 ||
+            t.rfind("proj ", 0) == 0 || t.rfind("columns ", 0) == 0 ||
+            t.rfind("cols ", 0) == 0) {
             break;
         }
 
@@ -89,36 +113,23 @@ std::string Parser::collectSQL(int minIndent, std::string& redirect_file, bool& 
         std::regex redir(R"(^(.*?)\s*(->|>>|>)\s*([^\s>]+)\s*$)");
         std::smatch match;
         if (std::regex_match(t, match, redir)) {
-            // Strip trailing semicolon from the SQL part if present
             std::string sql_part = match[1].str();
             if (!sql_part.empty() && sql_part.back() == ';') sql_part.pop_back();
             sql += (sql.empty() ? "" : "\n") + sql_part;
             redirect_file = match[3].str();
+            // Strip trailing semicolon from filename if present
+            if (!redirect_file.empty() && redirect_file.back() == ';')
+                redirect_file.pop_back();
             append = (match[2].str() == ">>");
-            // -> is non-appending export, same as >
             pos++;
             break;
-        }
-
-        // If this is not the first line and we don't already have an open
-        // statement (no semicolon yet collected), only continue if we ARE
-        // already mid-statement (sql is non-empty and no semicolon ended it).
-        // A new same-indent line after a complete single-line statement
-        // is a new statement — we stop here and let parseBlock handle it.
-        if (!sql.empty()) {
-            std::string prev = trim(sql);
-            if (!prev.empty() && prev.back() != ';') {
-                // Still mid-statement — keep collecting.
-                // Nothing to do, fall through.
-            }
         }
 
         if (!sql.empty()) sql += "\n";
         sql += lines[pos];
         pos++;
 
-        // Semicolon at end of line terminates this statement.
-        // Strip it — DuckDB doesn't need it and it avoids confusion.
+        // Semicolon terminates — strip it before returning
         std::string trimmed = trim(sql);
         if (!trimmed.empty() && trimmed.back() == ';') {
             sql = trimmed.substr(0, trimmed.size() - 1);
@@ -152,10 +163,11 @@ ASTPtr Parser::parseProjection(int baseIndent) {
     }
     pos++;
 
-    // Collect continuation lines (indented deeper)
+    // Collect continuation lines (indented deeper than the projection keyword)
+    int proj_step = detectIndentStep(baseIndent);
     while (pos < (int)lines.size()) {
         int lvl = indentLevel(lines[pos]);
-        if (lvl <= baseIndent) break;
+        if (lvl < baseIndent + proj_step) break;
         std::string t = trim(lines[pos]);
         if (t.empty() || t.rfind("--", 0) == 0) { pos++; continue; }
         if (!cols.empty()) cols += ",\n    ";
@@ -188,7 +200,8 @@ ASTPtr Parser::parseLet(int baseIndent) {
 
     pos++;
     std::string redirect; bool app = false;
-    std::string more = collectSQL(baseIndent + 4, redirect, app);
+    int let_step = detectIndentStep(baseIndent);
+    std::string more = collectSQL(baseIndent + let_step, redirect, app);
     if (!more.empty()) {
         if (!sql.empty()) sql += "\n";
         sql += more;
@@ -205,9 +218,10 @@ ASTPtr Parser::parseVal(int baseIndent) {
     std::string expr = trim(line.substr(eq + 1));
 
     pos++;
-    // Collect multi-line continuation (same rule as let)
+    // Collect multi-line continuation
     std::string redirect; bool app = false;
-    std::string more = collectSQL(baseIndent + 4, redirect, app);
+    int val_step = detectIndentStep(baseIndent);
+    std::string more = collectSQL(baseIndent + val_step, redirect, app);
     if (!more.empty()) {
         if (!expr.empty()) expr += "\n";
         expr += more;
@@ -235,7 +249,8 @@ ASTPtr Parser::parseFor(int baseIndent) {
     }
 
     pos++;
-    auto body = parseBlock(baseIndent + 4);
+    int for_step = detectIndentStep(baseIndent);
+    auto body = parseBlock(baseIndent + for_step);
     return std::make_shared<ASTNode>(ForStmt{var, src, body}, ln);
 }
 
@@ -248,7 +263,8 @@ ASTPtr Parser::parseIf(int baseIndent) {
                      ? line.substr(l + 1, r - l - 1) : "";
 
     pos++;
-    auto thenb = parseBlock(baseIndent + 4);
+    int if_step = detectIndentStep(baseIndent);
+    auto thenb = parseBlock(baseIndent + if_step);
 
     std::vector<ASTPtr> elseb;
     if (pos < (int)lines.size()) {
@@ -257,7 +273,7 @@ ASTPtr Parser::parseIf(int baseIndent) {
             elseb.push_back(parseIf(baseIndent));
         } else if (nxt.rfind("else:", 0) == 0) {
             pos++;
-            elseb = parseBlock(baseIndent + 4);
+            elseb = parseBlock(baseIndent + if_step);
         }
     }
     return std::make_shared<ASTNode>(IfStmt{cond, thenb, elseb}, ln);
@@ -272,7 +288,8 @@ ASTPtr Parser::parseWhile(int baseIndent) {
                      ? line.substr(l + 1, r - l - 1) : "";
 
     pos++;
-    auto body = parseBlock(baseIndent + 4);
+    int while_step = detectIndentStep(baseIndent);
+    auto body = parseBlock(baseIndent + while_step);
     return std::make_shared<ASTNode>(WhileStmt{cond, body}, ln);
 }
 
@@ -321,9 +338,10 @@ ASTPtr Parser::parseFn(int baseIndent) {
     }
 
     pos++;
-    auto body = parseBlock(baseIndent + 4);
+    int fn_step = detectIndentStep(baseIndent);
+    auto body = parseBlock(baseIndent + fn_step);
 
-    return std::make_shared<ASTNode>(FnStmt{name, params, body, ""}, ln);
+    return std::make_shared<ASTNode>(FnStmt{name, params, body}, ln);
 }
 
 ASTPtr Parser::parsePrint() {

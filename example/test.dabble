@@ -1,0 +1,10 @@
+let testdata = SELECT 0 as num
+
+val c = 0
+
+while (c < 100) 
+	c = c + 1;
+	INSERT INTO testdata VALUES (c);
+
+testdata;
+print 'inserted {{c}} rows into testdata';
