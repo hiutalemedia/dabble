@@ -456,6 +456,9 @@ The dependency graph tracks: `let` tables, `val` scalars, `fn` functions, `proje
 
 Dependency analysis never executes the script — it only parses. Cold start is practically instant.
 
+Example using --format=dot
+![deps](example/dataflow.png)
+
 ---
 
 ## What Dabble actually sends to DuckDB
