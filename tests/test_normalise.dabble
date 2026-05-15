@@ -26,7 +26,7 @@ val expr = 10 * 5;
 check (expr = 50) else fail 'scalar expression normalise failed';
 
 -- Date
-val d = CURRENT_DATE;
+val d = CAST('2026-01-01' AS DATE);
 check (d >= '2024-01-01') else fail 'date val normalise failed';
 
 -- String literal val

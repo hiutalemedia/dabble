@@ -16,7 +16,7 @@ val pi = 3.14159;
 check (ROUND(pi, 2) = 3.14) else fail 'val float failed';
 
 -- Date
-val today = CURRENT_DATE;
+val today = CAST('2026-01-01' AS DATE);
 check (today >= '2024-01-01') else fail 'val date failed';
 
 -- Expression with explicit FROM
@@ -32,7 +32,7 @@ val total2 = SUM(n) FROM nums;
 check (total2 = 15) else fail 'val FROM inference failed';
 
 -- String formatting
-val label = STRFTIME(CURRENT_DATE, '%Y');
+val label = STRFTIME(CAST('2026-01-01' AS DATE), '%Y');
 check (LENGTH(label) = 4) else fail 'val STRFTIME failed';
 
 -- Reassignment
