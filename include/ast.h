@@ -29,7 +29,10 @@ using ASTPtr = std::shared_ptr<ASTNode>;
 
 struct LetStmt    { std::string name, sql; };
 struct ValStmt    { std::string name, expr; };  // scalar: stores first cell in env
-struct ForStmt    { std::string var, source; std::vector<ASTPtr> body; };
+struct ForStmt    { std::string index_var, var, source; std::vector<ASTPtr> body; };
+//   index_var: set if "for i, row in table:" — empty otherwise
+struct BreakStmt    {};  // break; — exit the enclosing for/while
+struct ContinueStmt {};  // continue; — skip to next iteration
 struct IfStmt     { std::string cond; std::vector<ASTPtr> thenb, elseb; };
 struct WhileStmt  { std::string cond; std::vector<ASTPtr> body; };
 struct ExpectStmt { std::string condition; std::string action; std::string message; };
@@ -48,7 +51,8 @@ struct ArrLetStmt { std::string name; std::string expr; };  // += append stateme
 
 struct ASTNode {
     std::variant<LetStmt, ValStmt, ForStmt, IfStmt, WhileStmt, ExpectStmt,
-                 FnStmt, SQLStmt, PrintStmt, LogStmt, ImportStmt, ProjectionStmt, ArrLetStmt> node;
+                 FnStmt, SQLStmt, PrintStmt, LogStmt, ImportStmt, ProjectionStmt,
+                 ArrLetStmt, BreakStmt, ContinueStmt> node;
     int line_no = 0;
 
     template<typename T>

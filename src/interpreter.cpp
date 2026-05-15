@@ -138,6 +138,8 @@ void Interpreter::execBlock(const std::vector<ASTPtr>& block, Env env, RawEnv ra
                 if constexpr (std::is_same_v<T, ImportStmt>)     return "import " + x.filename;
                 if constexpr (std::is_same_v<T, ProjectionStmt>) return "projection " + x.name;
                 if constexpr (std::is_same_v<T, ArrLetStmt>)         return x.name + " +=";
+                if constexpr (std::is_same_v<T, BreakStmt>)          return "break";
+                if constexpr (std::is_same_v<T, ContinueStmt>)       return "continue";
 
                 if constexpr (std::is_same_v<T, SQLStmt>) {
                     std::string s = x.sql.substr(0, 40);
@@ -150,6 +152,8 @@ void Interpreter::execBlock(const std::vector<ASTPtr>& block, Env env, RawEnv ra
         }
 
         std::visit([&](auto&& x){ exec(x, env, raw); }, n->node);
+        // Stop processing this block if break or continue was signalled
+        if (loop_signal != LoopSignal::None) break;
     }
 }
 
@@ -231,6 +235,20 @@ static std::string normaliseSQL(const std::string& sql, bool scalar_context = fa
         size_t kw_pos = up.find(table_clauses[i]);
         if (kw_pos != std::string::npos && kw_pos > 0 && up[kw_pos - 1] == ' ')
             return "SELECT * FROM " + trimmed;
+    }
+
+    // Known DuckDB table functions — always SELECT * FROM, never scalar.
+    // These must be detected before the bare-ident check since they have parens.
+    static const char* TABLE_FUNCS[] = {
+        "read_csv(", "read_parquet(", "read_json(", "read_ndjson(",
+        "range(", "generate_series(", "glob(", "scan_arrow(",
+        "read_csv_auto(", "parquet_scan(", nullptr
+    };
+    for (int i = 0; TABLE_FUNCS[i]; i++) {
+        std::string tf = TABLE_FUNCS[i];
+        std::transform(tf.begin(), tf.end(), tf.begin(),
+                       [](unsigned char c){ return std::toupper(c); });
+        if (up.rfind(tf, 0) == 0) return "SELECT * FROM " + trimmed;
     }
 
     // Bare identifier: letters, digits, underscores only.
@@ -523,7 +541,21 @@ void Interpreter::printResult(duckdb_result* res) {
 }
 
 
-// ====================== ARRAY LET ======================
+
+// ====================== BREAK / CONTINUE ======================
+
+void Interpreter::exec(const BreakStmt&, Env&, RawEnv&) {
+    // Signal the enclosing for/while to stop iterating.
+    // execBlock checks this after each statement and stops processing.
+    loop_signal = LoopSignal::Break;
+}
+
+void Interpreter::exec(const ContinueStmt&, Env&, RawEnv&) {
+    // Signal the enclosing for/while to skip to the next iteration.
+    loop_signal = LoopSignal::Continue;
+}
+
+// ====================== ARRAY LET =======================
 //
 // Array lets store an ordered list of temp tables named __arr_{name}_{n}.
 // A TEMP VIEW named {name} is recreated on every append as:
@@ -892,10 +924,8 @@ void Interpreter::exec(const ForStmt& s, Env& env, RawEnv& raw) {
         RawEnv local_raw = raw;
 
         // Bind each column of the current row into local env/raw.
-        // env  → getvariable('__val_N_col') so typed values are compared correctly in SQL
-        //        e.g. WHERE category = getvariable(...) compares string to string properly
-        // raw  → actual string value for {{col}} injection
-        // Both are scoped to this iteration and cleaned up after execBlock.
+        // env  → getvariable() ref so values are SQL-typed (no quoting issues)
+        // raw  → actual string for {{col}} template injection
         std::vector<std::string> row_vars;
         for (idx_t c = 0; c < cols; c++) {
             char* val = duckdb_value_varchar(&res, c, r);
@@ -903,7 +933,6 @@ void Interpreter::exec(const ForStmt& s, Env& env, RawEnv& raw) {
             std::string value = val ? val : "";
             if (val) duckdb_free(val);
 
-            // Create a DuckDB variable so the value is typed and SQL-safe
             std::string varname = "__val_" + std::to_string(fn_depth + 1) + "_" + s.var + "_" + col;
             std::string escaped;
             for (char ch : value) {
@@ -917,21 +946,39 @@ void Interpreter::exec(const ForStmt& s, Env& env, RawEnv& raw) {
             local_raw[s.var + "." + col] = value;
         }
 
-        // Single-column shorthand: bind bare var name too.
-        // "for name in products.name:" → use `name` not `name.name`
+        // Single-column shorthand: also bind the bare var name
         if (cols == 1) {
             char* sv = duckdb_value_varchar(&res, 0, r);
             std::string sv_val = sv ? sv : "";
             if (sv) duckdb_free(sv);
-            // env: bare name also uses getvariable so it's SQL-safe
             local[s.var]     = "getvariable('" + row_vars[0] + "')";
             local_raw[s.var] = sv_val;
+        }
+
+        // Index variable: "for i, row in table:" binds i as 1-based integer
+        std::string idx_varname;
+        if (!s.index_var.empty()) {
+            idx_varname = "__val_" + std::to_string(fn_depth + 1) + "_" + s.index_var;
+            dbExec("SET VARIABLE " + idx_varname + " = " + std::to_string(r + 1));
+            row_vars.push_back(idx_varname);
+            local[s.index_var]     = "getvariable('" + idx_varname + "')";
+            local_raw[s.index_var] = std::to_string(r + 1);
         }
 
         execBlock(s.body, local, local_raw);
 
         // Clean up row variables after each iteration
         for (auto& v : row_vars) dbExec("RESET VARIABLE " + v);
+
+        // Handle break/continue signals from the body
+        if (loop_signal == LoopSignal::Break) {
+            loop_signal = LoopSignal::None;
+            break;
+        }
+        if (loop_signal == LoopSignal::Continue) {
+            loop_signal = LoopSignal::None;
+            // continue to next iteration naturally
+        }
     }
     if (show_progress && rows > 1) clearProgressLine();
     duckdb_destroy_result(&res);
@@ -957,6 +1004,15 @@ void Interpreter::exec(const WhileStmt& s, Env& env, RawEnv& raw) {
         for (auto& n : s.body) {
             current_line = n->line_no;
             std::visit([&](auto&& x){ exec(x, env, raw); }, n->node);
+            if (loop_signal != LoopSignal::None) break;
+        }
+        if (loop_signal == LoopSignal::Break) {
+            loop_signal = LoopSignal::None;
+            break;
+        }
+        if (loop_signal == LoopSignal::Continue) {
+            loop_signal = LoopSignal::None;
+            // continue to next while iteration
         }
     }
 }
@@ -1282,7 +1338,7 @@ void Interpreter::exec(const SQLStmt& s, Env& env, RawEnv& raw) {
             if (!built.empty()) {
                 if (!s.redirect_file.empty()) {
                     std::string copy_sql = "COPY (" + built + ") TO '" + s.redirect_file +
-                                           "' (FORMAT CSV, HEADER" + (s.append ? ", APPEND" : "") + ")";
+                                           "' (FORMAT CSV" + (s.append ? ", APPEND" : ", HEADER") + ")";
                     std::string err = dbExec(copy_sql);
                     for (auto& v : r.vars_to_reset) dbExec("RESET VARIABLE " + v);
                     if (!err.empty())
@@ -1312,7 +1368,7 @@ void Interpreter::exec(const SQLStmt& s, Env& env, RawEnv& raw) {
     // Redirect to file
     if (!s.redirect_file.empty()) {
         std::string copy_sql = "COPY (" + sql + ") TO '" + s.redirect_file +
-                               "' (FORMAT CSV, HEADER" + (s.append ? ", APPEND" : "") + ")";
+                               "' (FORMAT CSV" + (s.append ? ", APPEND" : ", HEADER") + ")";
         std::string err = dbExec(copy_sql);
         if (!err.empty()) {
             clearProgressLine(); std::cerr << red("error: ") << loc() << "export: " << err << "\n";

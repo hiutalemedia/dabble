@@ -27,10 +27,16 @@ DuckDB is still the engine you drive with. Dabble is just the gearbox that gives
 Requires CMake 3.20+ and a C++20 compiler. DuckDB is downloaded automatically.
 
 ```bash
-git clone https://github.com/yourname/dabble
+# clone
+git clone https://github.com/hiutalemedia/dabble
 cd dabble
+
+# build
 cmake -B build
 cmake --build build -j
+
+# test
+test --test-dir build --output-on-failure
 ```
 
 Run a script:
@@ -236,15 +242,35 @@ Iterates over every row of a table, inline query, or column shorthand.
 ```sql
 -- Standard loop:
 for c in customers:
-    print '{{c.name}} spent ${{c.total}}'
+    print '{{c.name}} spent ${{c.total}}';
+
+-- Enumerated loop — i is 1-based:
+for i, row in customers ORDER BY name:
+    print i || '. {{row.name}}: $' || row.total;
 
 -- table.column shorthand — single-column, var IS the value:
 for name in customers.name:
-    print name || ' (' || UPPER(name) || ')'
+    print '  - {{name}}';
 
 -- Inline query as source:
 for row in (SELECT region, SUM(revenue) AS rev FROM summary GROUP BY region):
-    print '{{row.region}}: $' || ROUND(row.rev, 2)
+    print '{{row.region}}: $' || ROUND(row.rev, 2);
+```
+
+**`break`** exits the loop immediately. **`continue`** skips to the next iteration.
+
+```sql
+-- Stop after first match:
+for row in orders ORDER BY id:
+    if (row.status = 'paid'):
+        print 'first paid: {{row.id}}';
+        break;
+
+-- Skip rows:
+for row in orders:
+    if (row.status = 'pending'):
+        continue;
+    process(row);
 ```
 
 ---
@@ -273,19 +299,29 @@ Vals defined outside the loop are visible inside, and mutations propagate back o
 Bare assignment (`c = expr`) works without repeating the `val` keyword for existing vals.
 
 ```sql
-val offset = 0
-val batch  = 1000
-val total  = COUNT(*) FROM events;
+val offset = 0;
+val batch  = 1000;
+val total  = SELECT COUNT(*) FROM events;
 
 while (offset < total):
     events WHERE rowid > offset LIMIT batch -> batch_{{offset}}.csv;
     offset = offset + batch;
 
--- or a simple counter:
-val c = 10
+-- Simple counter with bare reassignment:
+val c = 10;
 while (c > 0):
-    print 'tick: ' || c
+    print 'tick: ' || c;
     c = c - 1;
+```
+
+**`break`** and **`continue`** work inside `while` too:
+
+```sql
+val i = 0;
+while (i < 100):
+    i = i + 1;
+    if (i % 7 = 0):
+        break;  -- stop at first multiple of 7
 ```
 
 ---
@@ -357,6 +393,50 @@ let deals = SELECT * FROM orders
 ```
 
 System environment variables work the same way: `env.HOME`, `env.MY_SECRET`, etc.
+
+---
+
+### Logging — `log`
+
+Writes to `__dabble_log` (always queryable) and stderr. Same evaluation engine as `print`.
+
+```sql
+log 'pipeline started';             -- [info] pipeline started
+log warn 'low row count';           -- [warn] low row count
+log error 'threshold exceeded';     -- [error] threshold exceeded
+log debug 'batch: ' || batch;       -- only shown with --verbose
+
+-- Expressions and val references:
+log 'revenue: ' || total_revenue;
+log SUM(amount) FROM orders;
+log COUNT(*) FROM orders WHERE status = 'pending';
+
+-- Let table — logs metadata (row count), not the data:
+log paid;                            -- [info] let:paid — 7 rows
+```
+
+Log entries are written immediately and stay in `__dabble_log` for the session:
+
+```sql
+-- Query the log at any point:
+SELECT level, message, line FROM __dabble_log ORDER BY ts;
+
+-- Export the run log alongside data:
+__dabble_log -> logs/run_{{formatted_date}}.csv;
+
+-- Check for warnings at end of pipeline:
+check (COUNT(*) = 0 FROM __dabble_log WHERE level = 'error')
+    else fail 'pipeline completed with errors';
+```
+
+**Four levels:** `debug` (verbose only) · `info` (default) · `warn` · `error`
+
+**Persist to file** with `--log`:
+```bash
+dabble --log=pipeline.log.db  pipeline.dabble   # DuckDB — queryable across runs
+dabble --log=pipeline.log.csv pipeline.dabble   # CSV
+dabble --log=pipeline.log.json pipeline.dabble  # JSON
+```
 
 ---
 
@@ -568,10 +648,13 @@ Key things to notice:
 
 ## Roadmap / known gaps
 
-- [ ] Better indentation handling (currently hardcoded 4 spaces — tabs unsupported)
 - [ ] `return` for early exit from functions
 - [ ] Package/module system beyond `import`
 - [ ] Function return type inference (scalar vs table)
+- [ ] Dependency tracker `--deps` upstream/sources/destinations queries
+- [ ] DuckDB extension for session-level lineage tracking
+- [ ] fn-inside-fn CTE chaining (currently fns cannot call other Dabble fns inside their body)
+- [ ] Reserved word detection — DuckDB reserved words (`all`, `both`, `full`, etc.) cannot be used as `let` names; error messages could be clearer
 
 ---
 

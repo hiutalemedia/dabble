@@ -1,0 +1,34 @@
+-- test_exports.dabble
+
+let data = SELECT * FROM (VALUES (1, 'alice', 100), (2, 'bob', 200)) t(id, name, amount);
+val label = 'test';
+
+-- Export to CSV
+data -> /tmp/dabble_export_test.csv;
+
+let reimport = read_csv('/tmp/dabble_export_test.csv');
+check (COUNT(*) = 2 FROM reimport) else fail 'CSV export/reimport count failed';
+check (COUNT(*) = 1 FROM reimport WHERE name = 'alice') else fail 'CSV export value failed';
+
+-- Append mode: write two batches, read back
+let batch1 = SELECT 1 AS id, 'x' AS name;
+let batch2 = SELECT 2 AS id, 'y' AS name;
+batch1 -> /tmp/dabble_append_test.csv;
+batch2 -> /tmp/dabble_append_test2.csv;
+let combined_exports = SELECT * FROM read_csv('/tmp/dabble_append_test.csv')
+    UNION ALL SELECT * FROM read_csv('/tmp/dabble_append_test2.csv');
+check (COUNT(*) = 2 FROM combined_exports) else fail 'CSV multi-export count failed';
+
+-- Dynamic filename
+data -> /tmp/dabble_export_{{label}}.csv;
+let dynamic = read_csv('/tmp/dabble_export_test.csv');
+check (COUNT(*) >= 2 FROM dynamic) else fail 'dynamic filename export failed';
+
+-- Summary export
+let summary = SELECT SUM(amount) AS total FROM data;
+summary -> /tmp/dabble_summary_test.csv;
+let reimport2 = read_csv('/tmp/dabble_summary_test.csv');
+check (COUNT(*) = 1 FROM reimport2) else fail 'shorthand export failed';
+check (COUNT(*) = 1 FROM reimport2 WHERE total = 300) else fail 'shorthand export value failed';
+
+print 'PASS: test_exports';

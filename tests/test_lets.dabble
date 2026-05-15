@@ -1,0 +1,44 @@
+-- test_lets.dabble
+
+-- Full SELECT
+let a = SELECT * FROM (VALUES (1, 'x'), (2, 'y')) t(id, name);
+check (COUNT(*) = 2 FROM a) else fail 'let full SELECT failed';
+
+-- FROM shorthand
+let b = FROM (VALUES (10), (20), (30)) t(n);
+check (COUNT(*) = 3 FROM b) else fail 'let FROM shorthand failed';
+
+-- Bare table + WHERE clause shorthand
+let c = a WHERE id = 1;
+check (COUNT(*) = 1 FROM c) else fail 'let WHERE shorthand failed';
+check (COUNT(*) = 1 FROM c WHERE name = 'x') else fail 'let WHERE value failed';
+
+-- Table function shorthand
+let r = range(5);
+check (COUNT(*) = 5 FROM r) else fail 'let table function failed';
+
+-- table alias
+table d = a WHERE id = 2;
+check (COUNT(*) = 1 FROM d) else fail 'table alias failed';
+
+-- Multi-line let
+let e =
+    SELECT id * 10 AS big_id, name
+    FROM a
+    ORDER BY id;
+check (COUNT(*) = 2 FROM e) else fail 'multi-line let failed';
+check (COUNT(*) = 1 FROM e WHERE big_id = 10) else fail 'multi-line let value failed';
+
+-- let chaining
+let f = e WHERE big_id > 10;
+check (COUNT(*) = 1 FROM f) else fail 'let chaining failed';
+
+-- JOIN shorthand
+let g = SELECT a.id, a.name FROM a JOIN d ON a.id = d.id;
+check (COUNT(*) = 1 FROM g) else fail 'let JOIN failed';
+
+-- LIMIT shorthand
+let h = a LIMIT 1;
+check (COUNT(*) = 1 FROM h) else fail 'let LIMIT shorthand failed';
+
+print 'PASS: test_lets';

@@ -1,0 +1,54 @@
+-- test_array_lets.dabble
+-- Tests array let declaration, append, indexing, and view union.
+
+let a = SELECT * FROM (VALUES (1, 'x'), (2, 'y')) t(id, val);
+let b = SELECT * FROM (VALUES (3, 'z'), (4, 'w')) t(id, val);
+let c = SELECT * FROM (VALUES (5, 'v'))            t(id, val);
+
+-- Init from list
+let coll[] = [a, b, c];
+check (COUNT(*) = 5 FROM coll) else fail 'array let init list count failed';
+check (COUNT(*) = 1 FROM coll WHERE id = 3) else fail 'array let init list value failed';
+
+-- Positive index
+check (COUNT(*) = 2 FROM coll[1]) else fail 'array let [1] count failed';
+check (COUNT(*) = 1 FROM coll[1] WHERE val = 'x') else fail 'array let [1] value failed';
+
+-- Negative index
+check (COUNT(*) = 1 FROM coll[-1]) else fail 'array let [-1] count failed';
+check (COUNT(*) = 1 FROM coll[-1] WHERE val = 'v') else fail 'array let [-1] value failed';
+
+-- Scalar val index
+val idx = 2;
+check (COUNT(*) = 2 FROM coll[idx]) else fail 'array let [val] count failed';
+check (COUNT(*) = 1 FROM coll[idx] WHERE val = 'z') else fail 'array let [val] value failed';
+
+-- Empty init + append
+let built[] = [];
+built += a;
+built += b;
+
+check (COUNT(*) = 4 FROM built) else fail 'array let append count failed';
+check (COUNT(*) = 2 FROM built[1]) else fail 'array let append [1] failed';
+check (COUNT(*) = 2 FROM built[2]) else fail 'array let append [2] failed';
+check (COUNT(*) = 2 FROM built[-1]) else fail 'array let append [-1] failed';
+
+-- Append in for loop
+let batches[] = [];
+val ids = [10, 20, 30];
+for v in (SELECT unnest(ids) AS v):
+    batches += SELECT v.v AS n;
+
+check (COUNT(*) = 3 FROM batches) else fail 'array let loop append count failed';
+check (COUNT(*) = 1 FROM batches[1] WHERE n = 10) else fail 'array let loop [1] failed';
+check (COUNT(*) = 1 FROM batches[-1] WHERE n = 30) else fail 'array let loop [-1] failed';
+
+-- View reflects all appended items
+let snap[] = [];
+snap += SELECT 1 AS n;
+snap += SELECT 2 AS n;
+snap += SELECT 3 AS n;
+val snap_total = SUM(n) FROM snap;
+check (snap_total = 6) else fail 'array let view sum failed';
+
+print 'PASS: test_array_lets';

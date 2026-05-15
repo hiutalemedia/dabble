@@ -1,0 +1,53 @@
+-- test_vals.dabble
+
+-- Basic integer
+val x = 42;
+check (x = 42) else fail 'val integer failed';
+
+val y = x * 2;
+check (y = 84) else fail 'val arithmetic failed';
+
+-- String
+scalar greeting = 'hello';
+check (LENGTH(greeting) = 5) else fail 'val string length failed';
+
+-- Float
+val pi = 3.14159;
+check (ROUND(pi, 2) = 3.14) else fail 'val float failed';
+
+-- Date
+val today = CURRENT_DATE;
+check (today >= '2024-01-01') else fail 'val date failed';
+
+-- Expression with explicit FROM
+let nums = SELECT * FROM (VALUES (1), (2), (3), (4), (5)) t(n);
+val total = SELECT SUM(n) FROM nums;
+check (total = 15) else fail 'val FROM expression failed';
+
+val avg_n = SELECT AVG(n) FROM nums;
+check (avg_n = 3.0) else fail 'val AVG explicit FROM failed';
+
+-- FROM inference
+val total2 = SUM(n) FROM nums;
+check (total2 = 15) else fail 'val FROM inference failed';
+
+-- String formatting
+val label = STRFTIME(CURRENT_DATE, '%Y');
+check (LENGTH(label) = 4) else fail 'val STRFTIME failed';
+
+-- Reassignment
+val c = 1;
+c = c + 1;
+check (c = 2) else fail 'val reassignment failed';
+
+-- {{}} raw injection for table name
+val tbl = 'nums';
+let via_raw = SELECT n FROM {{tbl}} WHERE n > 3;
+check (COUNT(*) = 2 FROM via_raw) else fail 'val {{}} table injection failed';
+
+-- {{}} in string prefix construction
+val pfx = 'row_';
+let prefixed = SELECT '{{pfx}}' || CAST(n AS VARCHAR) AS row_label FROM nums WHERE n = 1;
+check (COUNT(*) = 1 FROM prefixed WHERE row_label = 'row_1') else fail 'val {{}} string concat failed';
+
+print 'PASS: test_vals';

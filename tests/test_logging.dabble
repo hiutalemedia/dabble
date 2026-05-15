@@ -1,0 +1,26 @@
+-- test_logging.dabble
+
+let data = SELECT * FROM (VALUES (1, 'x', 10), (2, 'y', 20)) t(id, name, val);
+val total = SELECT SUM(val) FROM data;
+
+log 'test run started';
+log warn 'this is a warning';
+log error 'this is an error log';
+log 'total: ' || total;
+log data;
+log SELECT SUM(val) FROM data;
+
+-- __dabble_log is queryable
+check (COUNT(*) >= 5 FROM __dabble_log) else fail 'log entries missing';
+
+check (COUNT(*) >= 1 FROM __dabble_log WHERE level = 'info') else fail 'log info level missing';
+check (COUNT(*) >= 1 FROM __dabble_log WHERE level = 'warn') else fail 'log warn level missing';
+check (COUNT(*) >= 1 FROM __dabble_log WHERE level = 'error') else fail 'log error level missing';
+
+check (COUNT(*) = 1 FROM __dabble_log WHERE message = 'test run started') else fail 'log string literal failed';
+
+check (COUNT(*) >= 1 FROM __dabble_log WHERE message LIKE '%data%' AND message LIKE '%rows%') else fail 'log table metadata failed';
+
+check (COUNT(*) >= 1 FROM __dabble_log WHERE message = '30') else fail 'log expression result failed';
+
+print 'PASS: test_logging';

@@ -89,8 +89,10 @@ std::vector<ASTPtr> Parser::parseBlock(int baseIndent) {
                 for (char c : lhs)
                     if (!std::isalnum((unsigned char)c) && c != '_') { is_arr_append = false; break; }
             }
-            if (is_arr_append) block.push_back(parseArrAppend(baseIndent));
-            else               block.push_back(parseRawSQL(baseIndent));
+            if (is_arr_append)                  block.push_back(parseArrAppend(baseIndent));
+            else if (t.rfind("break", 0) == 0)  { pos++; block.push_back(std::make_shared<ASTNode>(BreakStmt{}, pos)); }
+            else if (t.rfind("continue", 0) == 0) { pos++; block.push_back(std::make_shared<ASTNode>(ContinueStmt{}, pos)); }
+            else                                block.push_back(parseRawSQL(baseIndent));
         }
     }
     return block;
@@ -119,7 +121,9 @@ std::string Parser::collectSQL(int minIndent, std::string& redirect_file, bool& 
             t.rfind("print ", 0) == 0 || t.rfind("log ", 0) == 0 || t.rfind("import ", 0) == 0 ||
             t.rfind("else", 0) == 0 || t.rfind("projection ", 0) == 0 ||
             t.rfind("proj ", 0) == 0 || t.rfind("columns ", 0) == 0 ||
-            t.rfind("cols ", 0) == 0) {
+            t.rfind("cols ", 0) == 0 ||
+            t == "break" || t == "break;" ||
+            t == "continue" || t == "continue;") {
             break;
         }
 
@@ -237,6 +241,9 @@ ASTPtr Parser::parseLet(int baseIndent) {
     int prefix = (line.rfind("table ", 0) == 0) ? 6 : 4;
     std::string name = trim(line.substr(prefix, eq - prefix));
     std::string sql  = trim(line.substr(eq + 1));
+    // Strip trailing semicolon from single-line RHS
+    if (!sql.empty() && sql.back() == ';') sql.pop_back();
+    sql = trim(sql);
 
     // Detect array let declaration: "let name[] = []" or "let name[] = [a, b, c]"
     // Strip trailing [] from name to get the base name.
@@ -297,27 +304,35 @@ ASTPtr Parser::parseFor(int baseIndent) {
     int ln = pos + 1;
     std::string line = trim(lines[pos]);
     auto inpos = line.find(" in ");
-    std::string var = trim(line.substr(4, inpos - 4));
-    std::string src = trim(line.substr(inpos + 4, line.find(':') - (inpos + 4)));
+    std::string vars   = trim(line.substr(4, inpos - 4));
+    std::string source = trim(line.substr(inpos + 4, line.find(':') - (inpos + 4)));
+
+    // Detect enumeration: "for i, row in table:" → index_var="i", var="row"
+    std::string index_var, var;
+    auto comma = vars.find(',');
+    if (comma != std::string::npos) {
+        index_var = trim(vars.substr(0, comma));
+        var       = trim(vars.substr(comma + 1));
+    } else {
+        var = vars;
+    }
 
     // table.column shorthand: "for name in customers.name:"
     // → source becomes "(SELECT name FROM customers)"
-    // The loop variable then IS the value — no .column suffix needed.
-    auto dot = src.find('.');
+    auto dot = source.find('.');
     if (dot != std::string::npos &&
-        src.find(' ') == std::string::npos &&
-        src.find('(') == std::string::npos) {
-        std::string tbl = src.substr(0, dot);
-        std::string col = src.substr(dot + 1);
-        src = "(SELECT " + col + " FROM " + tbl + ")";
+        source.find(' ') == std::string::npos &&
+        source.find('(') == std::string::npos) {
+        std::string tbl = source.substr(0, dot);
+        std::string col = source.substr(dot + 1);
+        source = "(SELECT " + col + " FROM " + tbl + ")";
     }
 
     pos++;
     int for_step = detectIndentStep(baseIndent);
     auto body = parseBlock(baseIndent + for_step);
-    return std::make_shared<ASTNode>(ForStmt{var, src, body}, ln);
+    return std::make_shared<ASTNode>(ForStmt{index_var, var, source, body}, ln);
 }
-
 ASTPtr Parser::parseIf(int baseIndent) {
     int ln = pos + 1;
     std::string line = trim(lines[pos]);

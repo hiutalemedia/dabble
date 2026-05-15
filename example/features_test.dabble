@@ -342,3 +342,35 @@ log COUNT(*) FROM orders;
 -- Log table is queryable
 print SELECT 'log entries so far: ' || COUNT(*) FROM __dabble_log
 SELECT level, message FROM __dabble_log ORDER BY ts;
+
+-- ── 15. FOR INDEX, BREAK, CONTINUE ──────────────────────────
+
+print ''
+print '── 15. for index, break, continue ──'
+
+-- Enumerated for loop: i is 1-based
+print 'Enumerated customers:'
+for i, c in by_customer:
+    print '  ' || i || '. {{c.customer}} — $' || c.total_spent
+
+-- break: stop after first match
+print 'First electronics order:'
+for row in paid WHERE category = 'electronics':
+    print '  found: {{row.customer}} — {{row.product_name}}';
+    break;
+
+-- continue: skip stationery
+print 'Non-stationery paid orders:'
+for row in paid:
+    if (row.category = 'stationery'):
+        continue;
+    print '  {{row.customer}}: {{row.product_name}}';
+
+-- break in while
+val n = 1;
+while (n <= 10):
+    if (n > 3):
+        break;
+    print '  while n = ' || n;
+    n = n + 1;
+print 'broke out at n = ' || n

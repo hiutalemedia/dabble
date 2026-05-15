@@ -1,0 +1,71 @@
+-- test_control_flow.dabble
+
+let t = SELECT * FROM (VALUES (1, 10), (2, 20), (3, 30)) v(id, val);
+val mx = SELECT MAX(val) FROM t;
+
+-- Basic if
+CREATE TEMP TABLE results (label VARCHAR);
+if (mx > 25):
+    INSERT INTO results VALUES ('high');
+else:
+    INSERT INTO results VALUES ('low');
+
+check (COUNT(*) = 1 FROM results WHERE label = 'high') else fail 'if else high failed';
+
+-- Else if chain
+val score = 75;
+CREATE TEMP TABLE grade (g VARCHAR);
+if (score >= 90):
+    INSERT INTO grade VALUES ('A');
+else if (score >= 80):
+    INSERT INTO grade VALUES ('B');
+else if (score >= 70):
+    INSERT INTO grade VALUES ('C');
+else:
+    INSERT INTO grade VALUES ('F');
+
+check (COUNT(*) = 1 FROM grade WHERE g = 'C') else fail 'else if chain failed';
+
+-- if with explicit FROM
+val mx2 = SELECT MAX(val) FROM t;
+if (mx2 = 30):
+    INSERT INTO results VALUES ('max_correct');
+
+check (COUNT(*) = 1 FROM results WHERE label = 'max_correct') else fail 'if scalar val failed';
+
+-- nested if
+val a = 5;
+val b = 10;
+CREATE TEMP TABLE nested (n INTEGER);
+if (a < b):
+    if (b > 8):
+        INSERT INTO nested VALUES (1);
+    else:
+        INSERT INTO nested VALUES (2);
+else:
+    INSERT INTO nested VALUES (3);
+
+check (COUNT(*) = 1 FROM nested WHERE n = 1) else fail 'nested if failed';
+
+-- while with complex condition
+val wsum = 0;
+val wi = 1;
+while (wi <= 5 AND wsum < 10):
+    wsum = wsum + wi;
+    wi = wi + 1;
+
+check (wsum = 10) else fail 'while complex condition failed';
+
+-- if inside while with break
+val found = 0;
+val j = 1;
+while (j <= 10):
+    if (j = 7):
+        found = j;
+        break;
+    j = j + 1;
+
+check (found = 7) else fail 'if inside while failed';
+check (j = 7) else fail 'break in while val state failed';
+
+print 'PASS: test_control_flow';

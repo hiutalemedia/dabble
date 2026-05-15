@@ -77,6 +77,11 @@ class Interpreter {
     std::vector<std::string> file_stack;
     int current_line = 0;
     int fn_depth     = 0;
+
+    // Loop control signal — set by break/continue, consumed by for/while.
+    // Propagates through execBlock until the enclosing loop resets it.
+    enum class LoopSignal { None, Break, Continue };
+    LoopSignal loop_signal = LoopSignal::None;
     std::set<std::string> known_tables;            // tables created by let
 
     // Array lets: name → ordered list of internal table names (__arr_{name}_{n}).
@@ -112,6 +117,8 @@ private:
     void exec(const ProjectionStmt& s, Env& env, RawEnv& raw);
     void exec(const ArrLetStmt& s,     Env& env, RawEnv& raw);
     void exec(const LogStmt& s,        Env& env, RawEnv& raw);
+    void exec(const BreakStmt& s,      Env& env, RawEnv& raw);
+    void exec(const ContinueStmt& s,   Env& env, RawEnv& raw);
 
     bool evalCond(std::string cond, Env& env, RawEnv& raw);
     bool isFunctionCall(const std::string& sql, std::string& fn_name,

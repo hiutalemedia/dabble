@@ -88,6 +88,10 @@ std::string replaceAll(std::string s,
 }
 
 std::string replaceEnvVars(const std::string& input) {
+    // Replace env.VAR_NAME with a SQL-safe single-quoted string literal.
+    // This ensures paths, secrets, and other env var values with special
+    // characters (/, :, spaces) don't break the surrounding SQL.
+    // e.g. env.HOME → '/home/user'  (with escaped internal quotes)
     std::string s = input;
     std::regex env_pattern(R"(env\.([A-Za-z_][A-Za-z0-9_]*))");
     std::smatch match;
@@ -96,7 +100,15 @@ std::string replaceEnvVars(const std::string& input) {
     while (std::regex_search(s.cbegin() + pos, s.cend(), match, env_pattern)) {
         std::string var = match[1].str();
         const char* val = std::getenv(var.c_str());
-        std::string replacement = val ? val : "";
+        std::string raw = val ? val : "";
+        // Escape single quotes in the value for SQL safety
+        std::string escaped;
+        for (char c : raw) {
+            if (c == '\'') escaped += "\'\'";
+            else escaped += c;
+        }
+        // Wrap in single quotes so it's a SQL string literal
+        std::string replacement = "\'" + escaped + "\'";
         s.replace(pos + match.position(0), match.length(0), replacement);
         pos += match.position(0) + replacement.size();
     }

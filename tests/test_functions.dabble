@@ -1,0 +1,63 @@
+-- test_functions.dabble
+
+let orders = SELECT * FROM (VALUES
+    (1, 'alice', 'paid',    100.0),
+    (2, 'bob',   'paid',    200.0),
+    (3, 'alice', 'refund',  50.0),
+    (4, 'carol', 'paid',    150.0),
+    (5, 'bob',   'pending', 75.0)
+    ) AS t(id, customer, status, amount);
+
+-- No params
+fn all_paid():
+    SELECT * FROM orders WHERE status = 'paid'
+
+let paid = all_paid();
+check (COUNT(*) = 3 FROM paid) else fail 'fn no-params failed';
+
+-- Literal param
+fn by_status(s):
+    SELECT * FROM orders WHERE status = s
+
+let refunds = by_status('refund');
+check (COUNT(*) = 1 FROM refunds) else fail 'fn literal param failed';
+check (COUNT(*) = 1 FROM refunds WHERE customer = 'alice') else fail 'fn param value failed';
+
+-- Val param
+val min_amt = 120;
+fn above_amount(threshold):
+    SELECT * FROM orders WHERE amount > threshold AND status = 'paid'
+
+let big = above_amount(min_amt);
+check (COUNT(*) = 2 FROM big) else fail 'fn val param failed';
+
+-- Internal let (CTE)
+fn customer_totals():
+    let by_cust = SELECT customer, SUM(amount) AS total
+        FROM orders WHERE status = 'paid' GROUP BY customer
+    SELECT * FROM by_cust ORDER BY total DESC
+
+let totals = customer_totals();
+val totals_count = COUNT(*) FROM totals;
+check (totals_count = 3) else fail 'fn internal let CTE failed';
+check (COUNT(*) = 1 FROM totals WHERE customer = 'bob' AND total = 200) else fail 'fn CTE value failed';
+
+-- Standalone call
+customer_totals();
+
+-- LIMIT param
+fn top_n(n):
+    SELECT * FROM orders WHERE status = 'paid' ORDER BY amount DESC LIMIT n
+
+let top2 = top_n(2);
+check (COUNT(*) = 2 FROM top2) else fail 'fn LIMIT param failed';
+
+-- fn with multiple conditions
+fn paid_over(threshold):
+    SELECT * FROM orders WHERE status = 'paid' AND amount > threshold
+
+let over_99 = paid_over(99);
+val over_count = SELECT COUNT(*) FROM over_99;
+check (over_count >= 2) else fail 'fn chaining failed';
+
+print 'PASS: test_functions';

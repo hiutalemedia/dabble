@@ -1,0 +1,61 @@
+-- test_normalise.dabble
+
+let t = SELECT * FROM (VALUES (1, 'a', 10.0), (2, 'b', 20.0), (3, 'c', 5.0)) v(id, name, amount);
+
+-- FROM shorthand
+let f1 = FROM t WHERE id > 1;
+check (COUNT(*) = 2 FROM f1) else fail 'FROM shorthand failed';
+
+-- WHERE shorthand
+let f2 = t WHERE amount > 10;
+check (COUNT(*) = 1 FROM f2) else fail 'WHERE shorthand failed';
+
+-- ORDER shorthand
+let f3 = t ORDER BY amount DESC;
+check (COUNT(*) = 3 FROM f3) else fail 'ORDER shorthand failed';
+
+-- LIMIT shorthand
+let f4 = t LIMIT 2;
+check (COUNT(*) = 2 FROM f4) else fail 'LIMIT shorthand failed';
+
+-- Scalar val
+val n = 42;
+check (n = 42) else fail 'scalar val normalise failed';
+
+val expr = 10 * 5;
+check (expr = 50) else fail 'scalar expression normalise failed';
+
+-- Date
+val d = CURRENT_DATE;
+check (d >= '2024-01-01') else fail 'date val normalise failed';
+
+-- String literal val
+val s = 'hello world';
+check (LENGTH(s) = 11) else fail 'string val normalise failed';
+
+-- Subquery expression
+let sub = (SELECT id, name FROM t WHERE id = 1);
+check (COUNT(*) = 1 FROM sub) else fail 'subquery shorthand failed';
+
+-- Aggregate with explicit FROM
+val total = SELECT SUM(amount) FROM t;
+check (total = 35.0) else fail 'SUM explicit FROM failed';
+
+-- FROM inference for aggregate
+val total2 = SUM(amount) FROM t;
+check (total2 = 35.0) else fail 'SUM FROM explicit failed';
+
+-- MAX with explicit FROM
+val max_id = SELECT MAX(id) FROM t;
+check (max_id = 3) else fail 'MAX explicit FROM failed';
+
+-- getvariable in WHERE
+val threshold = 15.0;
+let above = t WHERE amount > threshold;
+check (COUNT(*) = 1 FROM above) else fail 'getvariable in WHERE failed';
+
+-- table function (no SELECT * FROM needed)
+let rng = range(3);
+check (COUNT(*) = 3 FROM rng) else fail 'table function normalise failed';
+
+print 'PASS: test_normalise';

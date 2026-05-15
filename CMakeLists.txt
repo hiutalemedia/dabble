@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(dabble LANGUAGES CXX)
+project(datalang LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -23,7 +23,7 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(duckdb)
 
-# ==================== dabble ====================
+# ==================== datalang ====================
 add_executable(dabble
     src/main.cpp
     src/parser.cpp
@@ -47,3 +47,24 @@ set_target_properties(dabble PROPERTIES
 )
 
 message(STATUS "DuckDB library: ${duckdb_SOURCE_DIR}/libduckdb.so")
+
+# ==================== Tests ====================
+enable_testing()
+
+set(DABBLE_BIN ${CMAKE_BINARY_DIR}/bin/dabble)
+set(TEST_DIR   ${CMAKE_SOURCE_DIR}/tests)
+
+# Helper: each .dabble test file is a CTest test.
+# Tests use "check ... else fail" internally — a failing check
+# exits non-zero, which CTest treats as a test failure.
+file(GLOB DABBLE_TESTS "${TEST_DIR}/test_*.dabble")
+foreach(TEST_FILE ${DABBLE_TESTS})
+    get_filename_component(TEST_NAME ${TEST_FILE} NAME_WE)
+    add_test(
+        NAME    ${TEST_NAME}
+        COMMAND ${DABBLE_BIN} ${TEST_FILE}
+    )
+    set_tests_properties(${TEST_NAME} PROPERTIES
+        TIMEOUT 30
+    )
+endforeach()

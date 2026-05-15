@@ -1,0 +1,30 @@
+-- test_checks.dabble
+-- Tests check/expect assertions, fail vs warn behaviour.
+
+let data = SELECT * FROM (VALUES (1, 10), (2, 20), (3, 30)) t(id, val);
+let empty = SELECT * FROM data WHERE id > 100;
+
+-- Basic check passes
+check  (COUNT(*) = 3 FROM data)     else fail 'basic check failed';
+expect (COUNT(*) > 0 FROM data)     else fail 'basic expect failed';
+
+-- check with FROM inference
+check  (MAX(val) = 30 FROM data)    else fail 'check FROM inference failed';
+
+-- check with scalar val
+val max_val = MAX(val) FROM data;
+check  (max_val = 30)               else fail 'check scalar val failed';
+
+-- warn does not exit
+check  (COUNT(*) = 0 FROM empty)    else warn 'empty table — this should warn but not fail';
+expect (COUNT(*) = 0 FROM data)     else warn 'data not empty — warn only';
+
+-- Both aliases work
+check  (1 = 1)                      else fail 'check keyword failed';
+expect (1 = 1)                      else fail 'expect keyword failed';
+
+-- Complex expressions
+check  (COUNT(DISTINCT id) = 3 FROM data) else fail 'check DISTINCT failed';
+check  (SUM(val) = 60 FROM data)          else fail 'check SUM failed';
+
+print 'PASS: test_checks';

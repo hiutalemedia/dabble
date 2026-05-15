@@ -1,0 +1,60 @@
+-- test_projections.dabble
+
+let data = SELECT * FROM (VALUES
+    (1, 'alice', 100.0, 'A'),
+    (2, 'bob',   200.0, 'B'),
+    (3, 'carol', 150.0, 'A')
+    ) AS t(id, name, amount, tier);
+
+-- Basic projection
+projection core =
+    id,
+    name,
+    ROUND(amount, 2) AS amount
+
+let basic = SELECT ...core FROM data;
+check (COUNT(*) = 3 FROM basic) else fail 'projection basic count failed';
+check (COUNT(*) = 3 FROM basic WHERE amount > 0) else fail 'projection column access failed';
+
+-- Multiple projections spread — avoid reserved words
+proj extra =
+    tier,
+    ROUND(amount * 1.1, 2) AS taxed
+
+let combined = SELECT ...core, ...extra FROM data;
+check (COUNT(*) = 3 FROM combined) else fail 'multi-projection count failed';
+check (COUNT(*) > 0 FROM combined WHERE tier = 'A') else fail 'multi-projection tier failed';
+
+-- Projection in GROUP BY
+cols stats =
+    tier,
+    COUNT(*)        AS n,
+    SUM(amount)     AS total
+
+let by_tier = SELECT ...stats FROM data GROUP BY tier ORDER BY tier;
+check (COUNT(*) = 2 FROM by_tier) else fail 'projection GROUP BY count failed';
+check (COUNT(*) = 1 FROM by_tier WHERE tier = 'A' AND n = 2) else fail 'projection GROUP BY value failed';
+
+-- Projection in function
+fn tier_summary():
+    SELECT ...stats FROM data GROUP BY tier ORDER BY total DESC
+
+let summary = tier_summary();
+check (COUNT(*) = 2 FROM summary) else fail 'projection in fn failed';
+
+-- cols alias
+cols name_only = name
+let names = SELECT ...name_only FROM data ORDER BY name;
+check (COUNT(*) = 3 FROM names) else fail 'cols alias failed';
+
+-- columns alias
+columns id_name = id, name
+let id_names = SELECT ...id_name FROM data;
+check (COUNT(*) = 3 FROM id_names) else fail 'columns alias failed';
+
+-- proj alias
+proj amounts = amount, tier
+let amt = SELECT ...amounts FROM data WHERE tier = 'B';
+check (COUNT(*) = 1 FROM amt) else fail 'proj alias failed';
+
+print 'PASS: test_projections';

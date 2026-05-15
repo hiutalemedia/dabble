@@ -1,0 +1,34 @@
+-- test_injection.dabble
+
+let t = SELECT * FROM (VALUES (1, 'paid'), (2, 'refund'), (3, 'paid')) v(id, status);
+
+-- Bare name injects getvariable() — typed, SQL-safe
+val target = 'paid';
+let paid = t WHERE status = target;
+check (COUNT(*) = 2 FROM paid) else fail 'bare name val injection failed';
+
+-- {{}} injects raw string — for table names, fragments
+val tbl = 't';
+let via_raw = SELECT * FROM {{tbl}} WHERE status = 'paid';
+check (COUNT(*) = 2 FROM via_raw) else fail '{{}} table name injection failed';
+
+-- {{}} in string prefix construction
+val prefix = 'sta';
+let prefixed = SELECT '{{prefix}}' || 'tus' AS col FROM t LIMIT 1;
+check (COUNT(*) = 1 FROM prefixed WHERE col = 'status') else fail '{{}} string concat failed';
+
+-- Mixed: bare name in WHERE, {{}} for fragment
+val condition = 'paid';
+let mixed = SELECT id FROM t WHERE status = '{{condition}}';
+check (COUNT(*) = 2 FROM mixed) else fail 'mixed injection failed';
+
+-- Bare name NOT substituted inside string literals
+val xv = 42;
+let literal = SELECT 'xv is not ' || xv AS msg FROM (VALUES (1)) v(n);
+check (COUNT(*) = 1 FROM literal WHERE msg = 'xv is not 42') else fail 'literal protection failed';
+
+-- env.VAR: value is quoted as SQL string literal, so paths are safe
+val env_home_len = LENGTH(COALESCE(env.HOME, 'none'));
+check (env_home_len >= 0) else fail 'env.VAR smoke test failed';
+
+print 'PASS: test_injection';
