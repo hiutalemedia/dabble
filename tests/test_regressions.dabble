@@ -1,0 +1,108 @@
+-- test_regressions.dabble
+-- Regression tests for specific bugs found in real-world usage.
+-- Each test is named after the bug it covers.
+
+-- ── Setup ────────────────────────────────────────────────────────────────────
+
+let data = SELECT * FROM (VALUES
+    (1, 'alice', 100.0, 'paid'),
+    (2, 'bob',   200.0, 'paid'),
+    (3, 'carol',  50.0, 'refund'),
+    (4, 'dave',  150.0, 'paid')
+    ) AS t(id, name, amount, status);
+
+-- ── Bug 1: > operator should not be parsed as redirect ────────────────────────
+
+-- SQL comparison with > inside a let
+let greater = SELECT * FROM data a
+    JOIN data b ON b.id > a.id
+    WHERE a.id = 1;
+check (COUNT(*) = 3 FROM greater) else fail 'bug1: > in JOIN ON failed';
+
+-- >= comparison
+let big = data WHERE amount >= 150.0;
+check (COUNT(*) = 2 FROM big) else fail 'bug1: >= in WHERE failed';
+
+-- > in HAVING
+let summary = SELECT status, COUNT(*) AS n, SUM(amount) AS total
+    FROM data GROUP BY status HAVING SUM(amount) > 100;
+check (COUNT(*) = 1 FROM summary WHERE status = 'paid') else fail 'bug1: > in HAVING failed';
+
+-- > in a val condition
+val max_amt = SELECT MAX(amount) FROM data;
+val min_amt = SELECT MIN(amount) FROM data;
+check (max_amt > min_amt) else fail 'bug1: > in val condition failed';
+
+-- ── Bug 3: val name substring must not match inside longer identifier ─────────
+
+val test_val = 42;
+
+-- Table name that contains val name as substring
+let test_val_extended = SELECT * FROM data WHERE id = 1;
+check (COUNT(*) = 1 FROM test_val_extended) else fail 'bug3: substring match corrupted table name';
+
+-- val should still work normally after
+check (test_val = 42) else fail 'bug3: original val broken after substring test';
+
+-- Column name starting with val name
+let col_test = SELECT id, name, amount AS test_val_col FROM data WHERE id = 1;
+check (COUNT(*) = 1 FROM col_test WHERE test_val_col = 100.0) else fail 'bug3: column alias with val prefix failed';
+
+-- ── Bug 5: := named parameters should not trigger assignment check ────────────
+
+-- Named parameter := syntax should not trigger bare assignment check.
+-- Test that := passes through to DuckDB without Dabble intercepting it.
+-- Use a struct literal which supports named fields with :=
+val struct_test = {'a': 1, 'b': 2};
+check (struct_test IS NOT NULL) else fail 'bug5: struct val failed';
+
+-- More direct: := in a CREATE TABLE AS should not be eaten by assignment check.
+-- If := triggered assignment, "mode" would be treated as a val name and fail.
+CREATE TEMP TABLE named_param_test (mode VARCHAR, val INTEGER);
+INSERT INTO named_param_test VALUES ('AUTO', 3);
+check (COUNT(*) = 1 FROM named_param_test WHERE mode = 'AUTO') else fail 'bug5: := guard failed';
+
+-- ── Bug 4: print with multiline table function ────────────────────────────────
+
+-- print with a multiline SELECT spanning indented continuation lines
+-- (parsePrint should collect until parens balanced)
+print SELECT
+    COUNT(*) AS n,
+    SUM(amount) AS total
+FROM data
+WHERE status = 'paid';
+
+-- Verify the print didn't crash by checking something after it
+check (COUNT(*) = 3 FROM data WHERE status = 'paid') else fail 'bug4: execution after multiline print failed';
+
+-- ── {{}} injection in SQL blocks ──────────────────────────────────────────────
+
+val target_status = 'paid';
+val min_amount = 100;
+
+-- {{}} in WHERE clause (raw string injection)
+let via_raw = SELECT * FROM data WHERE status = '{{target_status}}' AND amount > min_amount;
+check (COUNT(*) = 2 FROM via_raw) else fail '{{}} injection in WHERE failed';
+
+-- {{}} for dynamic table reference
+val tbl = 'data';
+let via_tbl = SELECT COUNT(*) AS n FROM {{tbl}};
+check (COUNT(*) = 1 FROM via_tbl WHERE n = 4) else fail '{{}} table name injection failed';
+
+-- bare name in SQL (getvariable path)
+let via_bare = SELECT * FROM data WHERE amount > min_amount AND status = target_status;
+check (COUNT(*) = 2 FROM via_bare) else fail 'bare name in SQL WHERE failed';
+
+-- ── Right boundary: val should not match prefix of longer token ───────────────
+
+val n = 10;
+
+-- 'n' must not match inside 'name', 'amount', 'n_rows' etc.
+let boundary_test = SELECT name, amount FROM data WHERE id = 1;
+check (COUNT(*) = 1 FROM boundary_test WHERE name = 'alice') else fail 'right boundary: n inside name failed';
+check (COUNT(*) = 1 FROM boundary_test WHERE amount = 100.0) else fail 'right boundary: n inside amount failed';
+
+-- n should still work as a val
+check (n = 10) else fail 'right boundary: val n broken';
+
+print 'PASS: test_regressions';

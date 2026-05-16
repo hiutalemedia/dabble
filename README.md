@@ -1,7 +1,5 @@
 # Dabble
 
-> **If it dabbles like a duck, it's probably Dabble.**
-
 Dabble is a lightweight scripting layer for DuckDB.
 
 It adds:
@@ -18,7 +16,7 @@ DuckDB is still the engine you drive with. Dabble is just the gearbox that gives
 
 ---
 
-> ⚠️ **This is still an experimental project**, although already useful. Please do not use it in production, critical pipelines, or anywhere that matters. It will probably eat your data, steal the breadcrumbs, and leave wet duck tracks on the floor.
+> ⚠️ **This is still an experimental project**, although already useful. Please do not use it in production, critical pipelines, or anywhere that matters. It will probably eat your data.
 
 ---
 
@@ -27,16 +25,18 @@ DuckDB is still the engine you drive with. Dabble is just the gearbox that gives
 Requires CMake 3.20+ and a C++20 compiler. DuckDB is downloaded automatically.
 
 ```bash
-# clone
 git clone https://github.com/hiutalemedia/dabble
 cd dabble
-
-# build
 cmake -B build
 cmake --build build -j
+```
 
-# test
-test --test-dir build --output-on-failure
+Build with specific Duckdb commit and extensions:
+```bash
+cmake -B build \
+    -DDUCKDB_COMMIT=abc123def456 \
+    -DDUCKDB_EXTENSIONS="ext1;ext2"
+cmake --build build -j
 ```
 
 Run a script:
@@ -571,9 +571,6 @@ The dependency graph tracks: `let` tables, `val` scalars, `fn` functions, `proje
 
 Dependency analysis never executes the script — it only parses. Cold start is practically instant.
 
-Example using --format=dot
-![deps](example/dataflow.png)
-
 ---
 
 ## What Dabble actually sends to DuckDB
@@ -637,6 +634,35 @@ Key things to notice:
 
 ---
 
+## Known limitations
+
+**`val` is eagerly evaluated.** A `val` captures its value at declaration time — once. If the underlying table is recreated later with different data, the val holds the stale value. Declare vals after the data they depend on is in its final state.
+
+```sql
+-- Wrong: val captures stale data
+val n = COUNT(*) FROM data;
+CREATE OR REPLACE TEMP TABLE data AS SELECT ...;  -- n still holds old count
+
+-- Right: declare after data is ready
+CREATE OR REPLACE TEMP TABLE data AS SELECT ...;
+val n = COUNT(*) FROM data;  -- captures current count
+```
+
+**Window functions in `val` subqueries.** DuckDB's `SET VARIABLE` uses scalar subquery evaluation which doesn't allow window functions. Materialise first:
+
+```sql
+-- Fails:
+val ids = SELECT list(row_number() OVER (ORDER BY name)) FROM foo;
+
+-- Works:
+let foo_ranked = SELECT row_number() OVER (ORDER BY name) AS rn FROM foo;
+val ids = SELECT list(rn ORDER BY rn) FROM foo_ranked;
+```
+
+**DuckDB reserved words** cannot be used as `let` names. Common ones: `all`, `both`, `full`, `group`, `order`, `select`, `table`, `values`, `from`, `where`. The error message ("syntax error at or near 'x'") is not very helpful — if a `let` mysteriously fails, check if the name is reserved.
+
+---
+
 ## What Dabble intentionally is not
 
 - **Not a general scripting language.** No file I/O beyond CSV/parquet, no HTTP, no string manipulation outside SQL.
@@ -655,6 +681,8 @@ Key things to notice:
 - [ ] DuckDB extension for session-level lineage tracking
 - [ ] fn-inside-fn CTE chaining (currently fns cannot call other Dabble fns inside their body)
 - [ ] Reserved word detection — DuckDB reserved words (`all`, `both`, `full`, etc.) cannot be used as `let` names; error messages could be clearer
+
+> **If it dabbles like a duck, it's probably Dabble.**
 
 ---
 

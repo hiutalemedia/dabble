@@ -52,7 +52,7 @@ std::string replaceAll(std::string s,
         size_t pos = 0;
         while ((pos = s.find(k, pos)) != std::string::npos) {
             bool left_ok = (pos == 0) || (!std::isalnum(s[pos - 1]) && s[pos - 1] != '.' && s[pos - 1] != '_');
-            bool right_ok = (pos + k.size() == s.size()) || (!std::isalnum(s[pos + k.size()]) && s[pos + k.size()] != '.');
+            bool right_ok = (pos + k.size() == s.size()) || (!std::isalnum(s[pos + k.size()]) && s[pos + k.size()] != '.' && s[pos + k.size()] != '_');
 
             // Skip if inside a {{...}} template
             bool in_template = false;

@@ -128,7 +128,9 @@ std::string Parser::collectSQL(int minIndent, std::string& redirect_file, bool& 
         }
 
         // Redirect operator ends the statement
-        std::regex redir(R"(^(.*?)\s*(->|>>|>)\s*([^\s>]+)\s*$)");
+        // Note: bare > is intentionally excluded — too ambiguous with SQL comparison operators.
+        // Only -> (export) and >> (append) are redirect operators.
+        std::regex redir(R"(^(.*?)\s*(->|>>)\s*([^\s>]+)\s*$)");
         std::smatch match;
         if (std::regex_match(t, match, redir)) {
             std::string sql_part = match[1].str();
@@ -433,22 +435,47 @@ ASTPtr Parser::parsePrint() {
                      : "";
     pos++;
 
-    // Collect continuation lines that are indented deeper than the print keyword.
-    // This lets SQL queries (and string concatenations) span multiple lines naturally:
+    // Collect continuation lines. Two rules:
+    //   1. Lines indented deeper than print always continue.
+    //   2. Lines at the same indent continue while parens are unbalanced —
+    //      this handles multiline table function calls:
     //
-    //   print SELECT 'total: ' || COUNT(*)
-    //       FROM orders
-    //       WHERE status = 'paid'
+    //      print SELECT * FROM dlx_count(
+    //          getvariable('n')::INTEGER,   ← deeper, collected
+    //          getvariable('rows')::INTEGER[][]
+    //      );                                ← same indent, but ) closes open paren
     //
-    // Lines at the same or shallower indent end the print expression.
+    // Count open parens in text collected so far to know when we're "inside" a call.
+    auto countOpenParens = [](const std::string& s) {
+        int depth = 0; bool in_s = false;
+        for (char c : s) {
+            if (c == '\'') { in_s = !in_s; continue; }
+            if (in_s) continue;
+            if (c == '(') depth++;
+            else if (c == ')') depth--;
+        }
+        return depth;
+    };
+
     while (pos < (int)lines.size()) {
         int lvl = indentLevel(lines[pos]);
-        if (lvl <= base_indent) break;
         std::string t = trim(lines[pos]);
-        if (!t.empty() && t.rfind("--", 0) != 0) {
-            text += " " + t;
-        }
+        if (t.empty() || t.rfind("--", 0) == 0) { pos++; continue; }
+
+        bool deeper    = lvl > base_indent;
+        bool unbalanced = countOpenParens(text) > 0;
+
+        if (!deeper && !unbalanced) break;
+
+        text += " " + t;
         pos++;
+
+        // Semicolon at end while balanced — done
+        std::string trimmed = trim(text);
+        if (!trimmed.empty() && trimmed.back() == ';' && countOpenParens(text) <= 0) {
+            text = trimmed.substr(0, trimmed.size() - 1);
+            break;
+        }
     }
 
     text = trim(text);
@@ -456,7 +483,6 @@ ASTPtr Parser::parsePrint() {
     text = trim(text);
 
     // Strip surrounding quotes for plain string literals.
-    // Don't strip when it's a SQL expression — quotes there are part of the SQL.
     if (text.length() >= 2 &&
         ((text.front() == '\'' && text.back() == '\'') ||
          (text.front() == '"' && text.back() == '"'))) {

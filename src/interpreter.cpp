@@ -1306,7 +1306,7 @@ void Interpreter::exec(const SQLStmt& s, Env& env, RawEnv& raw) {
             bool has_from = full_upper.find(" FROM ") != std::string::npos;
 
             if (before != '!' && before != '<' && before != '>' && before != '='
-                && !has_from) {
+                && before != ':' && !has_from) {  // : guards against named params (mode := 'AUTO')
                 std::string lhs = trim(orig.substr(0, eq));
                 bool is_ident = !lhs.empty();
                 for (char c : lhs)
