@@ -22,8 +22,9 @@ DuckDB is still the engine you drive with. Dabble is just the gearbox that gives
 
 ## Install
 
-Requires CMake 3.20+ and a C++20 compiler. DuckDB is downloaded automatically.
+Requires CMake 3.20+ and a C++20 compiler. 
 
+Option 1: Build with Duckdb downloaded automatically.
 ```bash
 git clone https://github.com/hiutalemedia/dabble
 cd dabble
@@ -31,11 +32,17 @@ cmake -B build
 cmake --build build -j
 ```
 
-Build with specific Duckdb commit and extensions:
+Option 2: Build with specific Duckdb commit and extensions:
 ```bash
 cmake -B build \
     -DDUCKDB_COMMIT=abc123def456 \
     -DDUCKDB_EXTENSIONS="ext1;ext2"
+cmake --build build -j
+```
+
+Option 3: Build with local duckdb build:
+```bash
+cmake -B build   -DDUCKDB_LOCAL=/duckdb-all-my-exts/duckdb/build/release/src   -DDUCKDB_INCLUDE=/duckdb-all-my-exts/duckdb/src/include
 cmake --build build -j
 ```
 
