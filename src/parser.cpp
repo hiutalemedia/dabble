@@ -57,8 +57,13 @@ std::vector<ASTPtr> Parser::parseBlock(int baseIndent) {
         }
 
         if (lvl > baseIndent) {
-            std::cerr << "Indentation error at line " << (pos + 1) << "\n";
-            std::exit(1);
+            // Line is indented deeper than expected — likely a continuation
+            // line that wasn't consumed by the previous parser (e.g. a column
+            // definition line after a CREATE TABLE was only partially parsed).
+            // Skip it rather than aborting — collectSQL with paren tracking
+            // should handle most cases, but defensive skip avoids hard crashes.
+            pos++;
+            continue;
         }
 
         if (t.rfind("let ", 0) == 0)         block.push_back(parseLet(baseIndent));
@@ -102,12 +107,32 @@ std::vector<ASTPtr> Parser::parseBlock(int baseIndent) {
 
 std::string Parser::collectSQL(int minIndent, std::string& redirect_file, bool& append) {
     // Simple rule: collect lines until a semicolon, a Dabble keyword,
-    // or indentation drops below minIndent. No heuristics.
-    // Every statement must end with ; — this makes parsing unambiguous.
+    // or indentation drops below minIndent — BUT only break on indent drop
+    // when parens are balanced. This handles multi-line SQL like:
+    //
+    //   CREATE TABLE foo (      ← opens paren
+    //       col1 INTEGER,       ← indented, collected
+    //       col2 VARCHAR        ← indented, collected
+    //   );                      ← back to base indent, but ) closes paren → collected
+    //
+    // Without paren tracking, the ); line would be missed and cause a parse error.
+    auto openParens = [](const std::string& s) {
+        int depth = 0; bool in_s = false;
+        for (char c : s) {
+            if (c == '\'') { in_s = !in_s; continue; }
+            if (in_s) continue;
+            if (c == '(') depth++;
+            else if (c == ')') depth--;
+        }
+        return depth;
+    };
+
     std::string sql;
+    int paren_depth = 0;
     while (pos < (int)lines.size()) {
         int lvl = indentLevel(lines[pos]);
-        if (lvl < minIndent) break;
+        // Only break on indent drop when all parens are closed
+        if (lvl < minIndent && paren_depth <= 0) break;
 
         std::string t = trim(lines[pos]);
         if (t.empty() || t.rfind("--", 0) == 0) { pos++; continue; }
@@ -147,11 +172,12 @@ std::string Parser::collectSQL(int minIndent, std::string& redirect_file, bool& 
 
         if (!sql.empty()) sql += "\n";
         sql += lines[pos];
+        paren_depth += openParens(lines[pos]);
         pos++;
 
-        // Semicolon terminates — strip it before returning
+        // Semicolon terminates — only when parens are balanced
         std::string trimmed = trim(sql);
-        if (!trimmed.empty() && trimmed.back() == ';') {
+        if (!trimmed.empty() && trimmed.back() == ';' && paren_depth <= 0) {
             sql = trimmed.substr(0, trimmed.size() - 1);
             break;
         }

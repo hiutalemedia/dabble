@@ -1,0 +1,102 @@
+-- test_complex_types.dabble
+-- Tests that arrays, structs, and maps work correctly as values and display properly.
+
+-- ── Array types ───────────────────────────────────────────────────────────────
+
+-- Create and query a table with INTEGER[] column
+CREATE TEMP TABLE arr_test (id INTEGER, tags INTEGER[], name VARCHAR);
+INSERT INTO arr_test VALUES (1, [1, 2, 3], 'alice');
+INSERT INTO arr_test VALUES (2, [4, 5],    'bob');
+INSERT INTO arr_test VALUES (3, [],        'carol');
+
+check (COUNT(*) = 3 FROM arr_test) else fail 'array col: table creation failed';
+
+-- Array length function
+val alice_tag_count = SELECT len(tags) FROM arr_test WHERE name = 'alice';
+check (alice_tag_count = 3) else fail 'array col: len failed';
+
+-- Array indexing (1-based in DuckDB)
+val first_tag = SELECT tags[1] FROM arr_test WHERE name = 'alice';
+check (first_tag = 1) else fail 'array col: index failed';
+
+-- Array contains
+check (COUNT(*) = 1 FROM arr_test WHERE list_contains(tags, 2)) else fail 'array col: contains failed';
+
+-- COLUMNS(*)::VARCHAR cast should render arrays as strings not NULL
+let arr_as_varchar = SELECT COLUMNS(*)::VARCHAR FROM arr_test WHERE name = 'alice';
+check (COUNT(*) = 1 FROM arr_as_varchar) else fail 'array col: COLUMNS cast failed';
+
+-- The tags column when cast to VARCHAR should contain '[' (array notation)
+val tags_str = SELECT tags::VARCHAR FROM arr_test WHERE name = 'alice';
+check (CONTAINS(tags_str, '[')) else fail 'array col: VARCHAR cast format failed';
+
+-- ── Struct types ──────────────────────────────────────────────────────────────
+
+CREATE TEMP TABLE struct_test (id INTEGER, meta STRUCT(a INTEGER, b VARCHAR));
+INSERT INTO struct_test VALUES (1, {'a': 42, 'b': 'hello'});
+INSERT INTO struct_test VALUES (2, {'a': 99, 'b': 'world'});
+
+check (COUNT(*) = 2 FROM struct_test) else fail 'struct col: table creation failed';
+
+-- Struct field access
+val struct_a = SELECT meta.a FROM struct_test WHERE id = 1;
+check (struct_a = 42) else fail 'struct col: field access failed';
+
+-- Struct as VARCHAR
+val struct_str = SELECT meta::VARCHAR FROM struct_test WHERE id = 1;
+check (CONTAINS(struct_str, 'hello')) else fail 'struct col: VARCHAR cast failed';
+
+-- ── Val storing arrays ────────────────────────────────────────────────────────
+
+-- DuckDB can store lists in variables
+val my_list = [10, 20, 30];
+val list_len = len(my_list);
+check (list_len = 3) else fail 'val list: len failed';
+
+val list_sum = list_sum(my_list);
+check (list_sum = 60) else fail 'val list: sum failed';
+
+-- List indexing on val
+val first_elem = my_list[1];
+check (first_elem = 10) else fail 'val list: index failed';
+
+-- ── CREATE TABLE with indented column definitions ─────────────────────────────
+
+-- Previously caused "Indentation error" — column definitions are indented
+-- deeper than the CREATE statement and ); is at base indent.
+CREATE OR REPLACE TEMP TABLE indent_create_test (
+    id       INTEGER PRIMARY KEY,
+    name     VARCHAR NOT NULL,
+    scores   INTEGER[],
+    metadata STRUCT(source VARCHAR, version INTEGER)
+);
+
+INSERT INTO indent_create_test VALUES (
+    1,
+    'test_row',
+    [1, 2, 3],
+    {'source': 'manual', 'version': 1}
+);
+
+check (COUNT(*) = 1 FROM indent_create_test) else fail 'indented CREATE: failed';
+check (COUNT(*) = 1 FROM indent_create_test WHERE name = 'test_row') else fail 'indented CREATE: value failed';
+
+val scores_len = SELECT len(scores) FROM indent_create_test WHERE id = 1;
+check (scores_len = 3) else fail 'indented CREATE: array col value failed';
+
+-- ── Two lets inside a for loop ────────────────────────────────────────────────
+
+let loop_src = SELECT * FROM (VALUES (1), (2), (3)) t(n);
+CREATE TEMP TABLE loop_results (doubled INTEGER, tripled INTEGER);
+
+for row in loop_src:
+    let dbl = SELECT row.n * 2 AS x;
+    let tpl = SELECT row.n * 3 AS y;
+    INSERT INTO loop_results SELECT x, y FROM dbl CROSS JOIN tpl;
+
+check (COUNT(*) = 3 FROM loop_results) else fail 'two lets in for: count failed';
+check (COUNT(*) = 1 FROM loop_results WHERE doubled = 2 AND tripled = 3) else fail 'two lets in for: row 1 failed';
+check (COUNT(*) = 1 FROM loop_results WHERE doubled = 4 AND tripled = 6) else fail 'two lets in for: row 2 failed';
+check (COUNT(*) = 1 FROM loop_results WHERE doubled = 6 AND tripled = 9) else fail 'two lets in for: row 3 failed';
+
+print 'PASS: test_complex_types';

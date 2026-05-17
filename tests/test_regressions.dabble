@@ -106,3 +106,5 @@ check (COUNT(*) = 1 FROM boundary_test WHERE amount = 100.0) else fail 'right bo
 check (n = 10) else fail 'right boundary: val n broken';
 
 print 'PASS: test_regressions';
+
+print 'PASS: test_regressions';

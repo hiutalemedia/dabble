@@ -518,6 +518,13 @@ void Interpreter::printResult(duckdb_result* res) {
     idx_t rows = duckdb_row_count(res);
     if (cols == 0) return;
 
+    // duckdb_value_varchar returns NULL for complex types (arrays, structs, maps).
+    // For those columns, fall back to a CAST ... AS VARCHAR re-execution so
+    // arrays like INTEGER[] display as [1, 2, 3] instead of NULL.
+    // We detect the need by trying the first row first.
+    // Build a cast-select to re-execute if needed — used as a fallback per column.
+
+    // Column headers
     for (idx_t c = 0; c < cols; c++) {
         printf("%-20s", duckdb_column_name(res, c));
         if (c < cols-1) printf(" | ");
@@ -528,11 +535,33 @@ void Interpreter::printResult(duckdb_result* res) {
         if (c < cols-1) printf("-+-");
     }
     printf("\n");
+
     for (idx_t r = 0; r < rows; r++) {
         for (idx_t c = 0; c < cols; c++) {
             char* val = duckdb_value_varchar(res, c, r);
-            printf("%-20s", val ? val : "NULL");
-            if (val) duckdb_free(val);
+            if (val) {
+                printf("%-20s", val);
+                duckdb_free(val);
+            } else {
+                // duckdb_value_varchar returned NULL — complex type (array, struct, map).
+                // Try duckdb_value_varchar with an explicit internal cast.
+                // DuckDB C API: use duckdb_value_varchar which may work for some types,
+                // or fall back to a type label so the user knows to CAST explicitly.
+                duckdb_type col_type = duckdb_column_type(res, c);
+                // Check if null vs complex type
+                bool is_null = duckdb_value_is_null(res, c, r);
+                if (is_null) {
+                    printf("%-20s", "NULL");
+                } else if (col_type == DUCKDB_TYPE_LIST || col_type == DUCKDB_TYPE_ARRAY) {
+                    printf("%-20s", "<list>");
+                } else if (col_type == DUCKDB_TYPE_STRUCT) {
+                    printf("%-20s", "<struct>");
+                } else if (col_type == DUCKDB_TYPE_MAP) {
+                    printf("%-20s", "<map>");
+                } else {
+                    printf("%-20s", "?");
+                }
+            }
             if (c < cols-1) printf(" | ");
         }
         printf("\n");
@@ -1080,10 +1109,21 @@ std::string Interpreter::evalText(const std::string& text, bool& is_multirow,
             duckdb_destroy_result(&res);
             return result;
         } else if (rows > 0) {
-            // Multi-row — caller handles display/logging
+            // Multi-row — apply COLUMNS(*)::VARCHAR cast via CTE so complex
+            // types (arrays, structs, maps) render correctly for the caller.
+            // The CTE puts COLUMNS(*) at the outermost SELECT where DuckDB
+            // can expand it properly.
             is_multirow = true;
             if (out_res) {
-                *out_res = res;  // caller owns the result, must destroy it
+                std::string cast_sql = "WITH __dabble_r AS (" + text +
+                                       ") SELECT COLUMNS(*)::VARCHAR FROM __dabble_r";
+                duckdb_result cast_res;
+                if (dbExec(cast_sql, &cast_res).empty()) {
+                    duckdb_destroy_result(&res);
+                    *out_res = cast_res;  // caller owns cast result
+                } else {
+                    *out_res = res;       // fallback: caller owns original result
+                }
             } else {
                 duckdb_destroy_result(&res);
             }
@@ -1392,7 +1432,22 @@ void Interpreter::exec(const SQLStmt& s, Env& env, RawEnv& raw) {
         std::transform(up2.begin(), up2.end(), up2.begin(),
                        [](unsigned char c){ return std::toupper(c); });
         bool is_select = up2.rfind("SELECT", 0) == 0 || up2.rfind("WITH", 0) == 0;
-        if (is_select && duckdb_column_count(&res) > 0) printResult(&res);
+        if (is_select && duckdb_column_count(&res) > 0) {
+            // Re-execute using a CTE so COLUMNS(*)::VARCHAR applies at the
+            // outermost SELECT level — DuckDB requires this for the macro to work.
+            // Using a CTE avoids the subquery wrapping issue:
+            //   WITH __r AS (original_sql) SELECT COLUMNS(*)::VARCHAR FROM __r
+            std::string typed_sql = "WITH __dabble_r AS (" + sql +
+                                    ") SELECT COLUMNS(*)::VARCHAR FROM __dabble_r";
+            duckdb_result typed_res;
+            if (dbExec(typed_sql, &typed_res).empty()) {
+                printResult(&typed_res);
+                duckdb_destroy_result(&typed_res);
+            } else {
+                // Fallback — print original result as-is
+                printResult(&res);
+            }
+        }
     }
     duckdb_destroy_result(&res);
 }
