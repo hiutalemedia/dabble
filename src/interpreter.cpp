@@ -185,13 +185,15 @@ static std::string normaliseSQL(const std::string& sql, bool scalar_context = fa
     if (up.rfind("SELECT", 0) == 0 || up.rfind("WITH", 0) == 0)
         return trimmed;
 
-    // Pass through: DML — never wrap in SELECT
-    if (up.rfind("CREATE", 0) == 0 || up.rfind("INSERT", 0) == 0 ||
-        up.rfind("UPDATE", 0) == 0 || up.rfind("DELETE", 0) == 0 ||
-        up.rfind("DROP",   0) == 0 || up.rfind("ALTER",  0) == 0 ||
-        up.rfind("COPY",   0) == 0 || up.rfind("ATTACH", 0) == 0 ||
-        up.rfind("DETACH", 0) == 0 || up.rfind("LOAD",   0) == 0 ||
-        up.rfind("INSTALL",0) == 0 || up.rfind("SET ",   0) == 0)
+    // Pass through: DML — never wrap in SELECT.
+    // Require a space after the keyword to avoid false matches on identifiers
+    // like CREATE_GROUP, INSERT_RESULTS, DELETE_ORPHANS, etc.
+    if (up.rfind("CREATE ", 0) == 0 || up.rfind("INSERT ", 0) == 0 ||
+        up.rfind("UPDATE ", 0) == 0 || up.rfind("DELETE ", 0) == 0 ||
+        up.rfind("DROP ",   0) == 0 || up.rfind("ALTER ",  0) == 0 ||
+        up.rfind("COPY ",   0) == 0 || up.rfind("ATTACH ", 0) == 0 ||
+        up.rfind("DETACH ", 0) == 0 || up.rfind("LOAD ",   0) == 0 ||
+        up.rfind("INSTALL ", 0) == 0 || up.rfind("SET ",   0) == 0)
         return trimmed;
 
     // Subquery expression: starts with ( — wrap as subquery source
@@ -753,7 +755,23 @@ FnResult Interpreter::execFn(const FnStmt& fn, Env env,
         } else {
             result.vars_to_reset.push_back(varname);  // defer, not val_scopes
             env[param] = "getvariable('" + varname + "')";
-            if (verbose) std::cout << dim("  param " + param + " = " + raw_arg) << "\n";
+
+            // Also set raw[param] so {{param}} injection works inside fn bodies.
+            // Fetch the actual string value via CAST — mirrors what exec(ValStmt) does.
+            {
+                duckdb_result raw_res;
+                if (dbExec("SELECT CAST(" + value_expr + " AS VARCHAR)", &raw_res).empty()
+                    && duckdb_row_count(&raw_res) > 0) {
+                    char* v = duckdb_value_varchar(&raw_res, 0, 0);
+                    raw[param] = v ? v : "";
+                    if (v) duckdb_free(v);
+                } else {
+                    raw[param] = raw_arg;  // fallback: use the original arg text
+                }
+                duckdb_destroy_result(&raw_res);
+            }
+
+            if (verbose) std::cout << dim("  param " + param + " = " + raw[param]) << "\n";
         }
     }
 

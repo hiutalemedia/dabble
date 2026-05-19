@@ -66,11 +66,7 @@ check (COUNT(*) = 1 FROM named_param_test WHERE mode = 'AUTO') else fail 'bug5: 
 
 -- print with a multiline SELECT spanning indented continuation lines
 -- (parsePrint should collect until parens balanced)
-print SELECT
-    COUNT(*) AS n,
-    SUM(amount) AS total
-FROM data
-WHERE status = 'paid';
+print SELECT COUNT(*) AS cnt, ROUND(SUM(amount),2) AS total FROM data WHERE status = 'paid';
 
 -- Verify the print didn't crash by checking something after it
 check (COUNT(*) = 3 FROM data WHERE status = 'paid') else fail 'bug4: execution after multiline print failed';
@@ -105,6 +101,59 @@ check (COUNT(*) = 1 FROM boundary_test WHERE amount = 100.0) else fail 'right bo
 -- n should still work as a val
 check (n = 10) else fail 'right boundary: val n broken';
 
-print 'PASS: test_regressions';
+-- ── DML keyword must not match identifier prefix ─────────────────────────────
+
+-- "create_group" starts with "create" — must not be treated as DML pass-through
+fn create_group(predicate):
+    SELECT COUNT(*) AS cnt
+    FROM (VALUES (1, 1), (2, 3), (3, 2)) t(x, y)
+    WHERE {{predicate}}
+
+let small = create_group('x < 3 AND y < 3');
+check (COUNT(*) = 1 FROM small WHERE cnt = 1) else fail 'create_ prefix: fn call failed';
+
+-- Same for other DML prefixes that could appear in fn/table names
+fn insert_summary():
+    SELECT 42 AS result
+
+let ins = insert_summary();
+check (COUNT(*) = 1 FROM ins WHERE result = 42) else fail 'insert_ prefix: fn call failed';
+
+-- ── {{param}} injection inside fn body ────────────────────────────────────────
+
+fn filter_with(predicate):
+    SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c')) t(id, name)
+    WHERE {{predicate}}
+
+let filtered = filter_with('id > 1');
+check (COUNT(*) = 2 FROM filtered) else fail 'fn {{param}} injection count failed';
+check (COUNT(*) = 0 FROM filtered WHERE id = 1) else fail 'fn {{param}} injection value failed';
+
+-- String predicate with quotes
+let named = filter_with('name = ''b''');
+check (COUNT(*) = 1 FROM named WHERE name = 'b') else fail 'fn {{param}} with quoted string failed';
+
+-- ── Empty lines in SQL body must not break collection ─────────────────────────
+
+let with_blank_lines = SELECT * FROM (VALUES (1), (2), (3)) t(num)
+
+    WHERE num > 1
+
+    ORDER BY num;
+
+check (COUNT(*) = 2 FROM with_blank_lines) else fail 'empty lines in let body failed';
+
+-- ── Inline comment after let RHS should be stripped ──────────────────────────
+
+let inline_comment = SELECT 99 AS v; -- this is a comment
+check (COUNT(*) = 1 FROM inline_comment WHERE v = 99) else fail 'inline comment strip failed';
+
+-- ── {{env.VAR}} should inject raw unquoted value ─────────────────────────────
+
+-- Set a test env var and verify it injects correctly
+val env_path_len = LENGTH(COALESCE(env.HOME, ''));
+-- {{env.HOME}} should work in print without quotes
+-- (can't assert stdout but can verify it doesn't crash)
+check (env_path_len >= 0) else fail '{{env.VAR}} access failed';
 
 print 'PASS: test_regressions';

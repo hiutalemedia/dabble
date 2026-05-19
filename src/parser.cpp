@@ -129,26 +129,32 @@ std::string Parser::collectSQL(int minIndent, std::string& redirect_file, bool& 
 
     std::string sql;
     int paren_depth = 0;
+    bool in_string = false;  // true when we're inside a SQL string literal
     while (pos < (int)lines.size()) {
-        int lvl = indentLevel(lines[pos]);
-        // Only break on indent drop when all parens are closed
-        if (lvl < minIndent && paren_depth <= 0) break;
-
         std::string t = trim(lines[pos]);
-        if (t.empty() || t.rfind("--", 0) == 0) { pos++; continue; }
 
-        // Dabble keywords always start a new statement
-        if (t.rfind("let ", 0) == 0 || t.rfind("table ", 0) == 0 ||
+        // Always skip empty lines and comments before indent check —
+        // an empty line inside a SQL body (e.g. between SELECT columns and
+        // a comment) must not terminate the statement.
+        if (!in_string && (t.empty() || t.rfind("--", 0) == 0)) { pos++; continue; }
+
+        int lvl = indentLevel(lines[pos]);
+        // Only break on indent drop when all parens are closed AND not in a string
+        if (lvl < minIndent && paren_depth <= 0 && !in_string) break;
+
+        // Dabble keywords only matter when not inside a string literal
+        if (!in_string && (
+            t.rfind("let ", 0) == 0 || t.rfind("table ", 0) == 0 ||
             t.rfind("val ", 0) == 0 || t.rfind("scalar ", 0) == 0 ||
             t.rfind("for ", 0) == 0 || t.rfind("if ", 0) == 0 ||
             t.rfind("while ", 0) == 0 || t.rfind("expect ", 0) == 0 ||
             t.rfind("check ", 0) == 0 || t.rfind("fn ", 0) == 0 ||
-            t.rfind("print ", 0) == 0 || t.rfind("log ", 0) == 0 || t.rfind("import ", 0) == 0 ||
-            t.rfind("else", 0) == 0 || t.rfind("projection ", 0) == 0 ||
-            t.rfind("proj ", 0) == 0 || t.rfind("columns ", 0) == 0 ||
-            t.rfind("cols ", 0) == 0 ||
+            t.rfind("print ", 0) == 0 || t.rfind("log ", 0) == 0 ||
+            t.rfind("import ", 0) == 0 || t.rfind("else", 0) == 0 ||
+            t.rfind("projection ", 0) == 0 || t.rfind("proj ", 0) == 0 ||
+            t.rfind("columns ", 0) == 0 || t.rfind("cols ", 0) == 0 ||
             t == "break" || t == "break;" ||
-            t == "continue" || t == "continue;") {
+            t == "continue" || t == "continue;")) {
             break;
         }
 
@@ -173,6 +179,11 @@ std::string Parser::collectSQL(int minIndent, std::string& redirect_file, bool& 
         if (!sql.empty()) sql += "\n";
         sql += lines[pos];
         paren_depth += openParens(lines[pos]);
+        // Track whether this line leaves us inside a string literal.
+        // Count unescaped single quotes — odd means we're inside a string.
+        for (char c : lines[pos]) {
+            if (c == '\'') in_string = !in_string;
+        }
         pos++;
 
         // Semicolon terminates — only when parens are balanced
@@ -269,6 +280,19 @@ ASTPtr Parser::parseLet(int baseIndent) {
     int prefix = (line.rfind("table ", 0) == 0) ? 6 : 4;
     std::string name = trim(line.substr(prefix, eq - prefix));
     std::string sql  = trim(line.substr(eq + 1));
+    // Strip inline comment (-- ...) from single-line RHS before semicolon check.
+    // e.g. "let x = fn('arg');  -- example usage" → "fn('arg')"
+    {
+        bool in_s = false;
+        size_t cmt = std::string::npos;
+        for (size_t i = 0; i < sql.size(); i++) {
+            if (sql[i] == '\'') { in_s = !in_s; continue; }
+            if (!in_s && sql[i] == '-' && i + 1 < sql.size() && sql[i+1] == '-') {
+                cmt = i; break;
+            }
+        }
+        if (cmt != std::string::npos) sql = trim(sql.substr(0, cmt));
+    }
     // Strip trailing semicolon from single-line RHS
     if (!sql.empty() && sql.back() == ';') sql.pop_back();
     sql = trim(sql);

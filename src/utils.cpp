@@ -32,6 +32,25 @@ std::string replaceAll(std::string s,
     const std::unordered_map<std::string,std::string>& env,
     const std::unordered_map<std::string,std::string>& raw) {
 
+    // Pre-pass: {{env.VAR}} → raw unquoted env var value.
+    // replaceEnvVars wraps values in single quotes for SQL safety,
+    // but inside {{}} the user wants the bare value for display/injection.
+    {
+        std::regex env_tpl(R"(\{\{env\.([A-Za-z_][A-Za-z0-9_]*)\}\})");
+        std::string result;
+        std::sregex_iterator it(s.begin(), s.end(), env_tpl);
+        std::sregex_iterator end_it;
+        size_t last = 0;
+        for (; it != end_it; ++it) {
+            result += s.substr(last, it->position() - last);
+            const char* val = std::getenv((*it)[1].str().c_str());
+            result += val ? val : "";
+            last = it->position() + it->length();
+        }
+        result += s.substr(last);
+        s = result;
+    }
+
     // {{name}} — raw string injection for SQL construction.
     // Fetches the actual string value so fragments like join clauses,
     // identifiers, and WHERE conditions are inlined verbatim.
